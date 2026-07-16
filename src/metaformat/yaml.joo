@@ -1,0 +1,16 @@
+package joolang.migrator.metaformat
+
+import std.Go
+
+// Binding into the external sigs.k8s.io/yaml module (SPEC §19 extern layer):
+// YAMLToJSON converts YAML bytes into their exact JSON equivalent, which joo
+// then decodes with the ordinary typed Json machinery — so YAML support costs a
+// single, well-audited external function and zero reflection on our side. A
+// joo-native YAML parser can replace this binding later without touching any
+// caller (MetaFile is the only consumer).
+@Go("sigs.k8s.io/yaml")
+pub extern class Yaml {
+
+	@Go("YAMLToJSON")
+	pub static ([]byte, exception) toJson(data []byte)
+}

@@ -1,0 +1,66 @@
+package joolang.migrator.dialects
+
+/** PostgreSQL (and CockroachDB, which speaks its wire protocol and SQL).
+ * Transactional DDL: a whole migration batch is atomic. Placeholders are $N. */
+pub class PostgresDialect impl: Dialect {
+
+	pub PostgresDialect() {}
+
+	pub string name() {
+		return "postgres"
+	}
+
+	pub boolean supportsTransactionalDdl() {
+		return true
+	}
+
+	pub string normalizeUrl(url string) {
+		return url // lib/pq and pgx run multi-statement scripts as-is
+	}
+
+	pub string createHistoryTable(table string) {
+		return "CREATE TABLE IF NOT EXISTS ${table} (" +
+			"code BIGINT NOT NULL PRIMARY KEY, " +
+			"id VARCHAR(255) NOT NULL, " +
+			"checksum VARCHAR(64) NOT NULL, " +
+			"applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+			"execution_ms BIGINT NOT NULL, " +
+			"profile VARCHAR(64) NOT NULL)"
+	}
+
+	pub string createLockTable(table string) {
+		return "CREATE TABLE IF NOT EXISTS ${table} (" +
+			"id INT NOT NULL PRIMARY KEY, " +
+			"owner VARCHAR(128) NOT NULL, " +
+			"acquired_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+			"expires_at BIGINT NOT NULL)"
+	}
+
+	pub string insertHistory(table string) {
+		return "INSERT INTO ${table} (code, id, checksum, execution_ms, profile) VALUES ($1, $2, $3, $4, $5)"
+	}
+
+	pub string deleteHistory(table string) {
+		return "DELETE FROM ${table} WHERE code = $1"
+	}
+
+	pub string selectApplied(table string) {
+		return "SELECT code, id, checksum FROM ${table} ORDER BY code"
+	}
+
+	pub string insertLock(table string) {
+		return "INSERT INTO ${table} (id, owner, expires_at) VALUES (1, $1, $2)"
+	}
+
+	pub string selectLock(table string) {
+		return "SELECT owner, expires_at FROM ${table} WHERE id = 1"
+	}
+
+	pub string stealLock(table string) {
+		return "UPDATE ${table} SET owner = $1, expires_at = $2 WHERE id = 1 AND expires_at = $3"
+	}
+
+	pub string releaseLock(table string) {
+		return "DELETE FROM ${table} WHERE id = 1 AND owner = $1"
+	}
+}

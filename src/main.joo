@@ -1,0 +1,10 @@
+package main
+
+// CLI entry point for the manual migration mode. The commands are wired in the
+// final stage; until then this is the compilable skeleton of the package.
+pub class Main {
+
+	pub static void main(args []string) {
+		log.info("joo-migrator: CLI commands land in the final stage")
+	}
+}

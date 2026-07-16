@@ -1,0 +1,118 @@
+package joolang.migrator.discovery
+
+import std.io.Files
+import std.io.Paths
+import std.collections.Lists
+import std.collections.Maps
+import std.serialization.Json
+import std.security.Hashes
+import joolang.migrator.metaformat.MetaFile
+
+/** Scans a migrations root (by convention `resources/migrations`) into an
+ * ordered, validated migration list.
+ *
+ * Each migration is a FOLDER named `NNN_name` (a numeric prefix, an underscore,
+ * a non-empty name — e.g. `000_db_init`) containing `up.sql` (required),
+ * `down.sql` (required, may be empty for consciously irreversible changes) and
+ * optionally one metadata file (see MetaFile). Non-folder entries (a README, a
+ * .gitkeep) are ignored; a FOLDER that does not follow the naming rule is an
+ * error — silently skipping it could skip a real migration. Duplicate codes are
+ * an error; gaps are allowed (deleting an old migration must not break the
+ * world). The result is ordered by code, ascending — the execution order. */
+pub class Scanner {
+
+	/** Scans root and returns the ordered migrations.
+	 * @param root the migrations folder
+	 * @return every valid migration, ordered by code ascending */
+	pub static ([]Migration, exception) scan(root string) {
+		if (!Files.exists(root)) {
+			return []Migration{}, Exceptions.new("migrations folder '${root}' does not exist")
+		}
+		var entries, lerr = Files.list(root)
+		if (Exceptions.eval(lerr)) {
+			return []Migration{}, lerr
+		}
+
+		var found []Migration = []Migration{}
+		var seen = map[int]string{}
+		for (var entry : entries) {
+			var dir = Paths.join(root, entry)
+			if (!Files.isDir(dir)) {
+				continue // stray files (README, .gitkeep) are not migrations
+			}
+			var code = Scanner.parseCode(entry)
+			if (code < 0) {
+				return []Migration{}, Exceptions.new(
+					"migration folder '${entry}' does not match NNN_name (numeric code, underscore, name)")
+			}
+			if (Maps.has(seen, code)) {
+				return []Migration{}, Exceptions.new(
+					"migrations '${Maps.getOr(seen, code, "")}' and '${entry}' share the code ${code}; codes must be unique")
+			}
+			seen[code] = entry
+
+			var loaded, merr = Scanner.load(code, entry, dir)
+			if (Exceptions.eval(merr)) {
+				return []Migration{}, merr
+			}
+			found = append(found, loaded)
+		}
+		return Lists.sort(found, (a, b) -> a.getCode() - b.getCode()), Exceptions.NULL
+	}
+
+	// parseCode extracts the numeric prefix of a folder name, or -1 when the
+	// name does not follow NNN_name.
+	intr static int parseCode(entry string) {
+		var sep = entry.indexOf("_")
+		if (sep <= 0 || sep == entry.length() - 1) {
+			return -1
+		}
+		return entry.substring(0, sep).toIntOr(-1)
+	}
+
+	// load reads one migration folder: both SQL scripts, the up.sql checksum and
+	// the metadata (defaults when the folder carries none).
+	intr static (Migration, exception) load(code int, entry string, dir string) {
+		var upPath = Paths.join(dir, "up.sql")
+		if (!Files.exists(upPath)) {
+			return null, Exceptions.new("migration '${entry}' is missing up.sql")
+		}
+		var downPath = Paths.join(dir, "down.sql")
+		if (!Files.exists(downPath)) {
+			return null, Exceptions.new(
+				"migration '${entry}' is missing down.sql (keep it empty for a consciously irreversible change)")
+		}
+		var upSql, uerr = Files.read(upPath)
+		if (Exceptions.eval(uerr)) {
+			return null, uerr
+		}
+		var downSql, derr = Files.read(downPath)
+		if (Exceptions.eval(derr)) {
+			return null, derr
+		}
+		var meta, xerr = Scanner.loadMeta(entry, dir)
+		if (Exceptions.eval(xerr)) {
+			return null, xerr
+		}
+		return Migration.new(code, entry, dir, upSql, downSql, Hashes.sha256(upSql), meta), Exceptions.NULL
+	}
+
+	// loadMeta normalizes the folder's metadata to JSON and decodes it typed;
+	// no metadata file means defaults (runs under every profile). (The local is
+	// named `text`, not `json`: a joo local named like a generated runtime import
+	// alias shadows it in the emitted Go — the known codegen-hygiene footgun.)
+	intr static (MigrationMeta, exception) loadMeta(entry string, dir string) {
+		var text, merr = MetaFile.readAsJson(dir)
+		if (Exceptions.eval(merr)) {
+			return null, merr
+		}
+		if (text == "") {
+			return MigrationMeta.new("", []string{}), Exceptions.NULL
+		}
+		var meta, jerr = Json.decode(text, MigrationMeta.class)
+		if (Exceptions.eval(jerr)) {
+			return null, Exceptions.merge(jerr, "migration '${entry}' has invalid metadata")
+		}
+		return meta, Exceptions.NULL
+	}
+}

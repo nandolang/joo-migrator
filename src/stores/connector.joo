@@ -1,0 +1,75 @@
+package joolang.migrator.stores
+
+import std.Env
+import std.sql.Db
+import std.sql.DbConfig
+import joolang.migrator.dialects.Dialect
+
+/** The resolved datasource coordinates the migrator connects with. */
+pub record Datasource {
+	intr driver string: [getter]
+	intr url string: [getter]
+}
+
+// DbProps pulls the project's datasource configuration through the standard
+// props resolution — process env var (DB_DRIVER/DB_URL form) >
+// properties-<env>.json > properties.json — so the migrator reads exactly what
+// the application reads, in both the in-app and the standalone CLI modes.
+pub class DbProps {
+
+	@Env(value = "db.driver", defaultValue = "")
+	pub driver string
+
+	@Env(value = "db.url", defaultValue = "")
+	pub url string
+}
+
+/** Resolves the datasource and opens the migrator's own, deliberately tiny
+ * connection pool.
+ *
+ * Precedence for the coordinates: explicit overrides (MigratorConfig/CLI
+ * flags) > environment variables > profile properties > base properties — the
+ * standard joo props ladder, plus the explicit layer on top.
+ *
+ * Migrations are strictly sequential, so the pool is capped at ONE open and
+ * one idle connection with a short lifetime: the migrator can never flood the
+ * database with hanging connections, whatever the application's own pool
+ * settings are. */
+pub class Connector {
+
+	/** Resolves the datasource coordinates.
+	 * @param driverOverride explicit driver ("" defers to props/env)
+	 * @param urlOverride explicit url ("" defers to props/env)
+	 * @return the resolved datasource, or an actionable error naming what is
+	 * missing */
+	pub static (Datasource, exception) resolve(driverOverride string, urlOverride string) {
+		var props = DbProps.new()
+		var driver = driverOverride != "" ? driverOverride : props.driver
+		var url = urlOverride != "" ? urlOverride : props.url
+		if (driver == "") {
+			return null, Exceptions.new(
+				"no database driver configured: set db.driver in resources/properties[-<env>].json, the DB_DRIVER env var, or the migrator config")
+		}
+		if (url == "") {
+			return null, Exceptions.new(
+				"no database url configured: set db.url in resources/properties[-<env>].json, the DB_URL env var, or the migrator config")
+		}
+		return Datasource.new(driver, url), Exceptions.NULL
+	}
+
+	/** Opens the migration connection: the dialect normalizes the URL (e.g.
+	 * MySQL gains multiStatements=true) and the pool is capped at one
+	 * connection with a five-minute lifetime.
+	 * @param source the resolved datasource
+	 * @param dialect the datasource's dialect
+	 * @return an open handle the caller must close */
+	pub static (Db, exception) open(source Datasource, dialect Dialect) {
+		var config = (DbConfig.new()
+			.driver(source.getDriver())
+			.url(dialect.normalizeUrl(source.getUrl()))
+			.maxOpen(1)
+			.maxIdle(1)
+			.maxLifetimeSeconds(300))
+		return Db.openWithConfig(config)
+	}
+}

@@ -1,0 +1,166 @@
+package joolang.migrator.discovery
+
+import std.test.Test
+import std.test.Before
+import std.test.After
+import std.test.Assert
+import std.io.Files
+import std.io.Paths
+import std.collections.Lists
+
+// Scanner contract: ordered numeric discovery, strict folder validation, loaded
+// scripts + checksum + typed metadata; MetaRules profile filtering. Each test
+// gets a fresh migrations root from @Before; @After removes it recursively —
+// also on assertion-failure paths.
+pub class ScannerTest {
+
+	intr root string
+
+	pub ScannerTest() {
+		this.root = ""
+	}
+
+	@Before
+	pub void createScratchRoot() {
+		var root, err = Files.mkdirTemp("", "joo-migrator-scan-*")
+		if (Exceptions.eval(err)) {
+			Assert.fail("mkdirTemp: ${err}")
+			return
+		}
+		this.root = root
+	}
+
+	@After
+	pub void removeScratchRoot() {
+		Files.remove(this.root)
+	}
+
+	@Test
+	pub void scansOrderedWithScriptsChecksumAndMeta() {
+		// created out of order on purpose; a stray file must be ignored
+		this.writeMigration("010_add_users", "CREATE TABLE users(id INT);", "DROP TABLE users;",
+			"migration.json", "{\"profiles\":[\"prod\"]}")
+		this.writeMigration("000_init", "abc", "DROP TABLE a;",
+			"migration.yml", "description: first things first\n")
+		this.writeMigration("005_middle", "CREATE TABLE b(y INT);", "DROP TABLE b;", "", "")
+		Files.write(Paths.join(this.root, "README.md"), "not a migration")
+
+		var found, serr = Scanner.scan(this.root)
+		if (Exceptions.eval(serr)) {
+			Assert.fail("scan: ${serr}")
+			return
+		}
+		Assert.equals(3, Lists.length(found))
+		Assert.equals(0, found[0].getCode())
+		Assert.equals(5, found[1].getCode())
+		Assert.equals(10, found[2].getCode())
+		Assert.equals("000_init", found[0].getId())
+		Assert.equals("abc", found[0].getUpSql())
+		Assert.equals("DROP TABLE a;", found[0].getDownSql())
+		// the checksum is sha256 of up.sql — pinned against the classic "abc"
+		// test vector so a silent hash change fails loudly
+		Assert.equals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+			found[0].getChecksum())
+		Assert.notEquals(found[0].getChecksum(), found[1].getChecksum())
+		// metadata: yml decoded, json decoded, absent defaults
+		Assert.equals("first things first", found[0].getMeta().getDescription())
+		Assert.isTrue(Lists.isEmpty(found[0].getMeta().getProfiles()))
+		Assert.equals("prod", found[2].getMeta().getProfiles()[0])
+		Assert.isTrue(Lists.isEmpty(found[1].getMeta().getProfiles()))
+	}
+
+	@Test
+	pub void emptyDownSqlIsAccepted() {
+		// a consciously irreversible migration keeps an empty down.sql
+		this.writeMigration("001_irreversible", "DROP TABLE legacy;", "", "", "")
+		var found, serr = Scanner.scan(this.root)
+		if (Exceptions.eval(serr)) {
+			Assert.fail("scan: ${serr}")
+			return
+		}
+		Assert.equals(1, Lists.length(found))
+		Assert.equals("", found[0].getDownSql())
+	}
+
+	@Test
+	pub void missingUpSqlFails() {
+		Files.mkdir(Paths.join(this.root, "001_broken"))
+		Files.write(Paths.join(this.root, "001_broken/down.sql"), "")
+		var _, serr = Scanner.scan(this.root)
+		Assert.isTrue(Exceptions.eval(serr))
+		Assert.contains("${serr}", "missing up.sql")
+	}
+
+	@Test
+	pub void missingDownSqlFails() {
+		Files.mkdir(Paths.join(this.root, "001_broken"))
+		Files.write(Paths.join(this.root, "001_broken/up.sql"), "SELECT 1;")
+		var _, serr = Scanner.scan(this.root)
+		Assert.isTrue(Exceptions.eval(serr))
+		Assert.contains("${serr}", "missing down.sql")
+	}
+
+	@Test
+	pub void malformedFolderNamesFail() {
+		// no underscore, empty name, empty code, non-numeric code — each is an
+		// error, never a silent skip
+		this.expectNameRejected("not-a-migration")
+		this.expectNameRejected("123_")
+		this.expectNameRejected("_x")
+		this.expectNameRejected("12x_y")
+	}
+
+	@Test
+	pub void duplicateCodeFails() {
+		// "000" and "0" are the same numeric code — the comparison is numeric
+		this.writeMigration("000_first", "SELECT 1;", "", "", "")
+		this.writeMigration("0_second", "SELECT 2;", "", "", "")
+		var _, serr = Scanner.scan(this.root)
+		Assert.isTrue(Exceptions.eval(serr))
+		Assert.contains("${serr}", "share the code 0")
+	}
+
+	@Test
+	pub void missingRootFails() {
+		var _, serr = Scanner.scan("does/not/exist")
+		Assert.isTrue(Exceptions.eval(serr))
+		Assert.contains("${serr}", "does not exist")
+	}
+
+	@Test
+	pub void metaRulesFilterByProfile() {
+		var everywhere = MigrationMeta.new("", []string{})
+		Assert.isTrue(MetaRules.runsIn(everywhere, ""))
+		Assert.isTrue(MetaRules.runsIn(everywhere, "prod"))
+		var devOnly = MigrationMeta.new("", []string{"dev"})
+		Assert.isTrue(MetaRules.runsIn(devOnly, "dev"))
+		Assert.isFalse(MetaRules.runsIn(devOnly, "prod"))
+		Assert.isFalse(MetaRules.runsIn(devOnly, ""))
+	}
+
+	// --- fixture helpers -----------------------------------------------------
+
+	// writeMigration lays out one migration folder; metaName "" writes no
+	// metadata file.
+	intr void writeMigration(folder string, up string, down string,
+			metaName string, metaContent string) {
+		var dir = Paths.join(this.root, folder)
+		Files.mkdir(dir)
+		Files.write(Paths.join(dir, "up.sql"), up)
+		Files.write(Paths.join(dir, "down.sql"), down)
+		if (metaName != "") {
+			Files.write(Paths.join(dir, metaName), metaContent)
+		}
+	}
+
+	// expectNameRejected scans a root holding only the given folder and asserts
+	// the naming-convention error, removing the folder afterwards.
+	intr void expectNameRejected(folder string) {
+		var dir = Paths.join(this.root, folder)
+		Files.mkdir(dir)
+		var _, serr = Scanner.scan(this.root)
+		Assert.isTrue(Exceptions.eval(serr))
+		Assert.contains("${serr}", "does not match NNN_name")
+		Files.remove(dir)
+	}
+}

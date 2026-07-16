@@ -1,0 +1,44 @@
+package joolang.migrator.discovery
+
+import std.collections.Lists
+
+/** The typed shape of a migration's metadata file (migration.yml/.yaml/.json).
+ * Every field is optional in the file; absent fields keep their zero value. */
+pub record MigrationMeta {
+	/** Free-text description shown by `status`. */
+	intr description string: [getter]
+	/** Profiles (joo envs) this migration runs under; empty = every profile. */
+	intr profiles []string: [getter]
+}
+
+/** One discovered migration folder, fully loaded: the numeric order key, both
+ * SQL scripts, the up.sql checksum (drift detection) and the parsed metadata. */
+pub record Migration {
+	/** The numeric prefix of the folder name ("000_db_init" → 0) — the order key. */
+	intr code int: [getter]
+	/** The full folder name, e.g. "000_db_init" — the identity recorded in history. */
+	intr id string: [getter]
+	/** Path of the migration folder. */
+	intr dir string: [getter]
+	intr upSql string: [getter]
+	intr downSql string: [getter]
+	/** sha256 of up.sql, verified against history on every run. */
+	intr checksum string: [getter]
+	intr meta MigrationMeta: [getter]
+}
+
+/** Rules over MigrationMeta that need logic (records stay data-only). */
+pub class MetaRules {
+
+	/** Whether a migration runs under the active profile: an empty profiles list
+	 * means "every profile"; otherwise the profile must be listed.
+	 * @param meta the migration's metadata
+	 * @param profile the active joo env/profile ("" when none is set)
+	 * @return true when the migration applies */
+	pub static boolean runsIn(meta MigrationMeta, profile string) {
+		if (Lists.isEmpty(meta.getProfiles())) {
+			return true
+		}
+		return Lists.contains(meta.getProfiles(), profile)
+	}
+}

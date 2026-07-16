@@ -1,0 +1,95 @@
+package joolang.migrator.metaformat
+
+import std.test.Test
+import std.test.Before
+import std.test.After
+import std.test.Assert
+import std.io.Files
+import std.io.Paths
+
+// MetaFile contract: every recognized format normalizes to the same JSON text,
+// absence is not an error, ambiguity and bad YAML are. Each test gets a fresh
+// temp folder from @Before; @After removes it recursively — also on the
+// assertion-failure paths, which a cleanup-after-asserts would leak.
+pub class MetaFileTest {
+
+	intr dir string
+
+	pub MetaFileTest() {
+		this.dir = ""
+	}
+
+	@Before
+	pub void createScratchDir() {
+		var dir, err = Files.mkdirTemp("", "joo-migrator-meta-*")
+		if (Exceptions.eval(err)) {
+			Assert.fail("mkdirTemp: ${err}")
+			return
+		}
+		this.dir = dir
+	}
+
+	@After
+	pub void removeScratchDir() {
+		Files.remove(this.dir)
+	}
+
+	@Test
+	pub void yamlConvertsToJson() {
+		Files.write(Paths.join(this.dir, "migration.yml"),
+			"description: init database\nprofiles:\n  - dev\n  - prod\n")
+		var json, err = MetaFile.readAsJson(this.dir)
+		if (Exceptions.eval(err)) {
+			Assert.fail("readAsJson: ${err}")
+			return
+		}
+		Assert.contains(json, "\"description\":\"init database\"")
+		Assert.contains(json, "\"profiles\":[\"dev\",\"prod\"]")
+	}
+
+	@Test
+	pub void yamlLongExtensionIsRecognized() {
+		Files.write(Paths.join(this.dir, "migration.yaml"), "description: long ext\n")
+		var json, err = MetaFile.readAsJson(this.dir)
+		if (Exceptions.eval(err)) {
+			Assert.fail("readAsJson: ${err}")
+			return
+		}
+		Assert.contains(json, "\"description\":\"long ext\"")
+	}
+
+	@Test
+	pub void jsonPassesThroughUntouched() {
+		Files.write(Paths.join(this.dir, "migration.json"), "{\"profiles\":[\"prod\"]}")
+		var json, err = MetaFile.readAsJson(this.dir)
+		if (Exceptions.eval(err)) {
+			Assert.fail("readAsJson: ${err}")
+			return
+		}
+		Assert.equals("{\"profiles\":[\"prod\"]}", json)
+	}
+
+	@Test
+	pub void missingMetadataIsEmptyNotAnError() {
+		var json, err = MetaFile.readAsJson(this.dir)
+		Assert.isFalse(Exceptions.eval(err))
+		Assert.equals("", json)
+	}
+
+	@Test
+	pub void duplicateMetadataIsAnError() {
+		Files.write(Paths.join(this.dir, "migration.yml"), "description: a\n")
+		Files.write(Paths.join(this.dir, "migration.json"), "{}")
+		var _, err = MetaFile.readAsJson(this.dir)
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "more than one metadata file")
+	}
+
+	@Test
+	pub void invalidYamlIsAnError() {
+		Files.write(Paths.join(this.dir, "migration.yml"), "\tdescription: [broken\n")
+		var _, err = MetaFile.readAsJson(this.dir)
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "invalid YAML metadata")
+	}
+}

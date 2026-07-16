@@ -1,0 +1,15 @@
+{
+	"#project": "joo-migrator — SQL schema migrations for joo projects: versioned up/down migrations under resources/migrations, profile-aware metadata, transactional batches, lock + history tables, automatic (in-app) and manual (CLI) modes",
+	"#proj.id": "joolang.migrator",
+	"main": "src/main.joo",
+	"#deps-note": "sigs.k8s.io/yaml backs the .yml metadata (joo-native parser planned as its replacement); modernc.org/sqlite is the built-in dev/test dialect driver — MySQL and PostgreSQL drivers are provided by the consuming project",
+	"goDeps": [
+		"modernc.org/sqlite"
+	],
+	"deps": {
+		"go": {
+			"sigs.k8s.io/yaml": "v1.6.0",
+			"modernc.org/sqlite": "v1.53.0"
+		}
+	}
+}

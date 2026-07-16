@@ -1,0 +1,188 @@
+package joolang.migrator.stores
+
+import std.test.Test
+import std.test.Assert
+import std.collections.Lists
+import std.sql.Db
+import joolang.migrator.dialects.SqliteDialect
+
+// Store integration over in-memory SQLite (the package's built-in dialect):
+// connector precedence, the lock protocol (contention, release, expiry steal)
+// and the transactional history ledger.
+pub class StoresTest {
+
+	@Test
+	pub void connectorRequiresCoordinates() {
+		var _, derr = Connector.resolve("", "")
+		Assert.isTrue(Exceptions.eval(derr))
+		Assert.contains("${derr}", "no database driver configured")
+		var _, uerr = Connector.resolve("sqlite", "")
+		Assert.isTrue(Exceptions.eval(uerr))
+		Assert.contains("${uerr}", "no database url configured")
+	}
+
+	@Test
+	pub void connectorOverridesWin() {
+		var source, err = Connector.resolve("sqlite", "file:conn-test?mode=memory&cache=shared")
+		if (Exceptions.eval(err)) {
+			Assert.fail("resolve: ${err}")
+			return
+		}
+		Assert.equals("sqlite", source.getDriver())
+		Assert.equals("file:conn-test?mode=memory&cache=shared", source.getUrl())
+	}
+
+	@Test
+	pub void lockBlocksSecondAcquire() {
+		var db, oerr = StoresTest.openDb("locka")
+		if (Exceptions.eval(oerr)) {
+			Assert.fail("open: ${oerr}")
+			return
+		}
+		var dialect = SqliteDialect.new()
+		var owner, aerr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("acquire: ${aerr}")
+			return
+		}
+		Assert.isTrue(owner.length() > 0)
+		var _, berr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		Assert.isTrue(Exceptions.eval(berr))
+		Assert.contains("${berr}", "locked by")
+		db.close()
+	}
+
+	@Test
+	pub void lockReleaseAllowsReacquire() {
+		var db, oerr = StoresTest.openDb("lockb")
+		if (Exceptions.eval(oerr)) {
+			Assert.fail("open: ${oerr}")
+			return
+		}
+		var dialect = SqliteDialect.new()
+		var owner, aerr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("acquire: ${aerr}")
+			return
+		}
+		var rerr = LockManager.release(db, dialect, "JOO_MIGRATIONS_LOCK", owner)
+		Assert.isFalse(Exceptions.eval(rerr))
+		var again, berr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		if (Exceptions.eval(berr)) {
+			Assert.fail("reacquire: ${berr}")
+			return
+		}
+		Assert.notEquals(owner, again)
+		db.close()
+	}
+
+	@Test
+	pub void expiredLockIsStolen() {
+		var db, oerr = StoresTest.openDb("lockc")
+		if (Exceptions.eval(oerr)) {
+			Assert.fail("open: ${oerr}")
+			return
+		}
+		var dialect = SqliteDialect.new()
+		// ttl 0: the lock is born expired — a crashed-holder stand-in
+		var dead, aerr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 0)
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("acquire: ${aerr}")
+			return
+		}
+		var thief, serr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		if (Exceptions.eval(serr)) {
+			Assert.fail("steal: ${serr}")
+			return
+		}
+		Assert.notEquals(dead, thief)
+		// the dead owner's release must NOT free the thief's lock
+		LockManager.release(db, dialect, "JOO_MIGRATIONS_LOCK", dead)
+		var _, cerr = LockManager.acquire(db, dialect, "JOO_MIGRATIONS_LOCK", 60000)
+		Assert.isTrue(Exceptions.eval(cerr))
+		db.close()
+	}
+
+	@Test
+	pub void historyLedgerRoundTrip() {
+		var db, oerr = StoresTest.openDb("hist")
+		if (Exceptions.eval(oerr)) {
+			Assert.fail("open: ${oerr}")
+			return
+		}
+		var dialect = SqliteDialect.new()
+		var eerr = HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		Assert.isFalse(Exceptions.eval(eerr))
+
+		var tx, terr = db.begin()
+		if (Exceptions.eval(terr)) {
+			Assert.fail("begin: ${terr}")
+			return
+		}
+		HistoryStore.add(tx, dialect, "JOO_MIGRATIONS_HISTORY", 5, "005_second", "bbb", 12, "dev")
+		HistoryStore.add(tx, dialect, "JOO_MIGRATIONS_HISTORY", 0, "000_init", "aaa", 3, "dev")
+		tx.commit()
+
+		var rows, aerr = HistoryStore.applied(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("applied: ${aerr}")
+			return
+		}
+		Assert.equals(2, Lists.length(rows))
+		Assert.isTrue(rows[0].getCode() == 0)
+		Assert.equals("000_init", rows[0].getId())
+		Assert.equals("aaa", rows[0].getChecksum())
+		Assert.isTrue(rows[1].getCode() == 5)
+
+		var tx2, terr2 = db.begin()
+		if (Exceptions.eval(terr2)) {
+			Assert.fail("begin 2: ${terr2}")
+			return
+		}
+		HistoryStore.remove(tx2, dialect, "JOO_MIGRATIONS_HISTORY", 5)
+		tx2.commit()
+		var after, aerr2 = HistoryStore.applied(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		if (Exceptions.eval(aerr2)) {
+			Assert.fail("applied 2: ${aerr2}")
+			return
+		}
+		Assert.equals(1, Lists.length(after))
+		db.close()
+	}
+
+	@Test
+	pub void rolledBackHistoryNeverLands() {
+		var db, oerr = StoresTest.openDb("histrb")
+		if (Exceptions.eval(oerr)) {
+			Assert.fail("open: ${oerr}")
+			return
+		}
+		var dialect = SqliteDialect.new()
+		HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		var tx, terr = db.begin()
+		if (Exceptions.eval(terr)) {
+			Assert.fail("begin: ${terr}")
+			return
+		}
+		HistoryStore.add(tx, dialect, "JOO_MIGRATIONS_HISTORY", 0, "000_init", "aaa", 3, "dev")
+		tx.rollback()
+		var rows, aerr = HistoryStore.applied(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("applied: ${aerr}")
+			return
+		}
+		Assert.isTrue(Lists.isEmpty(rows))
+		db.close()
+	}
+
+	// openDb opens a fresh in-memory SQLite database (shared cache + the
+	// connector's single pooled connection keep it alive and consistent).
+	intr static (Db, exception) openDb(name string) {
+		var db, oerr = Connector.open(
+			Datasource.new("sqlite", "file:${name}?mode=memory&cache=shared"), SqliteDialect.new())
+		if (Exceptions.eval(oerr)) {
+			return null, oerr
+		}
+		return db, Exceptions.NULL
+	}
+}

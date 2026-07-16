@@ -1,0 +1,84 @@
+package joolang.migrator.stores
+
+import std.sql.Db
+import std.time.Instant
+import std.os.Os
+import std.security.Uuid
+import joolang.migrator.dialects.Dialect
+
+/** The single lock row (id is always 1). */
+pub record LockRow {
+	intr owner string: [getter]
+	intr expiresAt long: [getter]
+}
+
+/** Cross-instance mutual exclusion over the lock table (JOO_MIGRATIONS_LOCK by
+ * default), so two application instances booting together never run the same
+ * migrations concurrently.
+ *
+ * The algorithm is portable across every dialect (no advisory locks): the lock
+ * is one row with a unique primary key — INSERT succeeds for exactly one
+ * contender. Expiry is an app-computed unix-millis deadline; an expired lock
+ * (a crashed migrator) is stolen with an optimistic UPDATE guarded by the old
+ * deadline, so two stealers cannot both win. */
+pub class LockManager {
+
+	/** Ensures the lock table and acquires the lock.
+	 * @param db the migration connection
+	 * @param dialect the datasource's dialect
+	 * @param table the lock table name
+	 * @param ttlMillis how long the lock stays valid before a crashed holder
+	 * may be stolen from
+	 * @return the owner token release() must be called with */
+	pub static (string, exception) acquire(db Db, dialect Dialect, table string, ttlMillis long) {
+		var _, cerr = db.exec(dialect.createLockTable(table))
+		if (Exceptions.eval(cerr)) {
+			return "", cerr
+		}
+		var owner = LockManager.newOwner()
+		var _, ierr = db.exec(dialect.insertLock(table), owner, Instant.now().epochMillis() + ttlMillis)
+		if (!Exceptions.eval(ierr)) {
+			return owner, Exceptions.NULL
+		}
+
+		// the insert conflicted: someone holds (or held) the lock — inspect it.
+		var row, qerr = db.queryOne(dialect.selectLock(table), LockRow.class)
+		if (Exceptions.eval(qerr)) {
+			// released between our insert and select: tell the caller to retry
+			// rather than looping here forever.
+			return "", Exceptions.merge(qerr, "migration lock is contended; retry")
+		}
+		var now = Instant.now().epochMillis()
+		if (row.getExpiresAt() > now) {
+			return "", Exceptions.new(
+				"migrations are locked by '${row.getOwner()}' (expires in ${row.getExpiresAt() - now} ms); " +
+				"if that instance crashed, the lock frees itself after the ttl")
+		}
+		var stolen, serr = db.exec(dialect.stealLock(table), owner, now + ttlMillis, row.getExpiresAt())
+		if (Exceptions.eval(serr)) {
+			return "", serr
+		}
+		if (stolen == 0) {
+			return "", Exceptions.new("the expired migration lock was taken by another instance; retry")
+		}
+		return owner, Exceptions.NULL
+	}
+
+	/** Releases the lock; a no-op when this owner no longer holds it (an
+	 * expired-and-stolen lock must not delete the thief's row). */
+	pub static exception release(db Db, dialect Dialect, table string, owner string) {
+		var _, err = db.exec(dialect.releaseLock(table), owner)
+		return err
+	}
+
+	// newOwner identifies this holder for diagnostics and guarded release:
+	// hostname plus a per-run unique suffix.
+	intr static string newOwner() {
+		var name = "unknown-host"
+		var host, herr = Os.hostname()
+		if (!Exceptions.eval(herr)) {
+			name = host
+		}
+		return "${name}@${Uuid.new()}"
+	}
+}

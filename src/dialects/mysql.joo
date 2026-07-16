@@ -1,0 +1,75 @@
+package joolang.migrator.dialects
+
+/** MySQL (and MariaDB). No transactional DDL — every DDL statement commits
+ * implicitly, so the engine runs batches sequentially there and compensates
+ * with down.sql on failure. Placeholders are ?. Whole-script execution needs
+ * multiStatements=true in the DSN: normalizeUrl adds it when absent and honors
+ * an explicit value already present in the URL. */
+pub class MysqlDialect impl: Dialect {
+
+	pub MysqlDialect() {}
+
+	pub string name() {
+		return "mysql"
+	}
+
+	pub boolean supportsTransactionalDdl() {
+		return false
+	}
+
+	pub string normalizeUrl(url string) {
+		if (url.contains("multiStatements=")) {
+			return url
+		}
+		if (url.contains("?")) {
+			return url + "&multiStatements=true"
+		}
+		return url + "?multiStatements=true"
+	}
+
+	pub string createHistoryTable(table string) {
+		return "CREATE TABLE IF NOT EXISTS ${table} (" +
+			"code BIGINT NOT NULL PRIMARY KEY, " +
+			"id VARCHAR(255) NOT NULL, " +
+			"checksum VARCHAR(64) NOT NULL, " +
+			"applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+			"execution_ms BIGINT NOT NULL, " +
+			"profile VARCHAR(64) NOT NULL)"
+	}
+
+	pub string createLockTable(table string) {
+		return "CREATE TABLE IF NOT EXISTS ${table} (" +
+			"id INT NOT NULL PRIMARY KEY, " +
+			"owner VARCHAR(128) NOT NULL, " +
+			"acquired_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+			"expires_at BIGINT NOT NULL)"
+	}
+
+	pub string insertHistory(table string) {
+		return "INSERT INTO ${table} (code, id, checksum, execution_ms, profile) VALUES (?, ?, ?, ?, ?)"
+	}
+
+	pub string deleteHistory(table string) {
+		return "DELETE FROM ${table} WHERE code = ?"
+	}
+
+	pub string selectApplied(table string) {
+		return "SELECT code, id, checksum FROM ${table} ORDER BY code"
+	}
+
+	pub string insertLock(table string) {
+		return "INSERT INTO ${table} (id, owner, expires_at) VALUES (1, ?, ?)"
+	}
+
+	pub string selectLock(table string) {
+		return "SELECT owner, expires_at FROM ${table} WHERE id = 1"
+	}
+
+	pub string stealLock(table string) {
+		return "UPDATE ${table} SET owner = ?, expires_at = ? WHERE id = 1 AND expires_at = ?"
+	}
+
+	pub string releaseLock(table string) {
+		return "DELETE FROM ${table} WHERE id = 1 AND owner = ?"
+	}
+}

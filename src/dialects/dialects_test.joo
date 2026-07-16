@@ -1,0 +1,102 @@
+package joolang.migrator.dialects
+
+import std.test.Test
+import std.test.Assert
+
+// Dialects contract: driver-name resolution (aliases included), capability
+// flags, URL normalization and the statement shapes the stores depend on.
+pub class DialectsTest {
+
+	@Test
+	pub void driverNamesResolveIncludingAliases() {
+		DialectsTest.expectDialect("postgres", "postgres")
+		DialectsTest.expectDialect("PostgreSQL", "postgres")
+		DialectsTest.expectDialect("pgx", "postgres")
+		DialectsTest.expectDialect("cockroachdb", "postgres")
+		DialectsTest.expectDialect("mysql", "mysql")
+		DialectsTest.expectDialect("mariadb", "mysql")
+		DialectsTest.expectDialect("sqlite", "sqlite")
+		DialectsTest.expectDialect("sqlite3", "sqlite")
+	}
+
+	@Test
+	pub void unknownDriverFailsListingSupport() {
+		var _, err = Dialects.forDriver("oracle")
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "unsupported db.driver 'oracle'")
+	}
+
+	@Test
+	pub void transactionalDdlCapability() {
+		Assert.isTrue(PostgresDialect.new().supportsTransactionalDdl())
+		Assert.isTrue(SqliteDialect.new().supportsTransactionalDdl())
+		Assert.isFalse(MysqlDialect.new().supportsTransactionalDdl())
+	}
+
+	@Test
+	pub void mysqlUrlGainsMultiStatements() {
+		var d = MysqlDialect.new()
+		Assert.equals("user:pw@tcp(db:3306)/app?multiStatements=true",
+			d.normalizeUrl("user:pw@tcp(db:3306)/app"))
+		Assert.equals("user:pw@tcp(db:3306)/app?parseTime=true&multiStatements=true",
+			d.normalizeUrl("user:pw@tcp(db:3306)/app?parseTime=true"))
+		// already configured (either value) is left untouched
+		Assert.equals("app?multiStatements=false", d.normalizeUrl("app?multiStatements=false"))
+	}
+
+	@Test
+	pub void otherUrlsPassThrough() {
+		Assert.equals("postgres://u@db/app", PostgresDialect.new().normalizeUrl("postgres://u@db/app"))
+		Assert.equals("file:app.db", SqliteDialect.new().normalizeUrl("file:app.db"))
+	}
+
+	@Test
+	pub void statementsCarryTheConfiguredTableName() {
+		var d, derr = Dialects.forDriver("postgres")
+		if (Exceptions.eval(derr)) {
+			Assert.fail("forDriver: ${derr}")
+			return
+		}
+		Assert.contains(d.createHistoryTable("MY_HISTORY"), "CREATE TABLE IF NOT EXISTS MY_HISTORY")
+		Assert.contains(d.createLockTable("MY_LOCK"), "CREATE TABLE IF NOT EXISTS MY_LOCK")
+		Assert.contains(d.insertHistory("MY_HISTORY"), "INSERT INTO MY_HISTORY")
+		Assert.contains(d.selectApplied("MY_HISTORY"), "FROM MY_HISTORY ORDER BY code")
+	}
+
+	@Test
+	pub void placeholderStylesMatchTheEngine() {
+		// postgres numbers its parameters; mysql/sqlite use positional ?
+		Assert.contains(PostgresDialect.new().insertHistory("H"), "($1, $2, $3, $4, $5)")
+		Assert.contains(MysqlDialect.new().insertHistory("H"), "(?, ?, ?, ?, ?)")
+		Assert.contains(SqliteDialect.new().insertHistory("H"), "(?, ?, ?, ?, ?)")
+		Assert.contains(PostgresDialect.new().stealLock("L"), "expires_at = $3")
+		Assert.contains(SqliteDialect.new().releaseLock("L"), "owner = ?")
+	}
+
+	@Test
+	pub void controlTableColumnsAgreeAcrossDialects() {
+		// the stores rely on ONE logical schema across every dialect; a column
+		// changed in only one dialect must fail here, not diverge silently
+		var all = []Dialect{PostgresDialect.new(), MysqlDialect.new(), SqliteDialect.new()}
+		var history = []string{"code", "id", "checksum", "applied_at", "execution_ms", "profile"}
+		var lock = []string{"id", "owner", "acquired_at", "expires_at"}
+		for (var d : all) {
+			for (var column : history) {
+				Assert.contains(d.createHistoryTable("H"), column)
+			}
+			for (var column : lock) {
+				Assert.contains(d.createLockTable("L"), column)
+			}
+		}
+	}
+
+	// expectDialect asserts a driver name resolves to the named dialect.
+	intr static void expectDialect(driver string, want string) {
+		var d, err = Dialects.forDriver(driver)
+		if (Exceptions.eval(err)) {
+			Assert.fail("forDriver(${driver}): ${err}")
+			return
+		}
+		Assert.equals(want, d.name())
+	}
+}

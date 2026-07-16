@@ -1,0 +1,49 @@
+package joolang.migrator.stores
+
+import std.sql.Db
+import std.sql.Tx
+import joolang.migrator.dialects.Dialect
+
+/** One applied migration as recorded in the history table. */
+pub record AppliedMigration {
+	intr code long: [getter]
+	intr id string: [getter]
+	intr checksum string: [getter]
+}
+
+/** The migration ledger (JOO_MIGRATIONS_HISTORY by default): which migrations
+ * ran, with the up.sql checksum for drift detection.
+ *
+ * Writes take the batch TRANSACTION, not the connection: when a transactional
+ * batch rolls back, its history rows vanish with it — the ledger can never
+ * claim a migration that was rolled back. Reads take the plain connection. */
+pub class HistoryStore {
+
+	/** Creates the history table when missing (idempotent). */
+	pub static exception ensure(db Db, dialect Dialect, table string) {
+		var _, err = db.exec(dialect.createHistoryTable(table))
+		return err
+	}
+
+	/** Every applied migration, ordered by code ascending. */
+	pub static ([]AppliedMigration, exception) applied(db Db, dialect Dialect, table string) {
+		var rows, err = db.query(dialect.selectApplied(table), AppliedMigration.class)
+		if (Exceptions.eval(err)) {
+			return []AppliedMigration{}, err
+		}
+		return rows, Exceptions.NULL
+	}
+
+	/** Records one applied migration inside the batch transaction. */
+	pub static exception add(tx Tx, dialect Dialect, table string,
+			code long, id string, checksum string, executionMs long, profile string) {
+		var _, err = tx.exec(dialect.insertHistory(table), code, id, checksum, executionMs, profile)
+		return err
+	}
+
+	/** Removes one migration from the ledger (a down), inside the transaction. */
+	pub static exception remove(tx Tx, dialect Dialect, table string, code long) {
+		var _, err = tx.exec(dialect.deleteHistory(table), code)
+		return err
+	}
+}

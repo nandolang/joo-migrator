@@ -1,0 +1,64 @@
+package joolang.migrator.metaformat
+
+import std.io.Files
+import std.io.Paths
+import std.io.Bytes
+
+/** Locates and normalizes a migration folder's metadata file.
+ *
+ * A migration folder may describe its execution rules in `migration.yml`,
+ * `migration.yaml` or `migration.json`; whatever the format, readAsJson returns
+ * the content as JSON text, ready for a typed `Json.decode` — YAML is converted
+ * through the {@link Yaml} binding. Exactly zero or one metadata file is
+ * allowed: none returns "" (the caller applies defaults), more than one is an
+ * error rather than a silent pick. */
+pub class MetaFile {
+
+	// the recognized metadata file names, in reporting order
+	intr static []string candidates() {
+		return []string{"migration.yml", "migration.yaml", "migration.json"}
+	}
+
+	/** Reads the folder's metadata as JSON text.
+	 * @param dir the migration folder
+	 * @return the metadata as JSON text, or "" when the folder has none */
+	pub static (string, exception) readAsJson(dir string) {
+		var found = ""
+		var count = 0
+		for (var name : MetaFile.candidates()) {
+			if (Files.exists(Paths.join(dir, name))) {
+				found = name
+				count = count + 1
+			}
+		}
+		if (count == 0) {
+			return "", Exceptions.NULL
+		}
+		if (count > 1) {
+			return "", Exceptions.new(
+				"migration '${Paths.base(dir)}' has more than one metadata file; keep exactly one of migration.yml/.yaml/.json")
+		}
+
+		var path = Paths.join(dir, found)
+		if (found == "migration.json") {
+			var text, terr = Files.read(path)
+			if (Exceptions.eval(terr)) {
+				return "", terr
+			}
+			return text, Exceptions.NULL
+		}
+
+		var raw, rerr = Files.readBytes(path)
+		if (Exceptions.eval(rerr)) {
+			return "", rerr
+		}
+		// extern call: recover turns a panic inside the Go library into an
+		// ordinary exception instead of taking the process down.
+		var jsonBytes, cerr = recover Yaml.toJson(raw)
+		if (Exceptions.eval(cerr)) {
+			return "", Exceptions.merge(cerr,
+				"migration '${Paths.base(dir)}' has invalid YAML metadata")
+		}
+		return Bytes.toString(jsonBytes), Exceptions.NULL
+	}
+}

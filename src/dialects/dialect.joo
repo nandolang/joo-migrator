@@ -1,0 +1,84 @@
+package joolang.migrator.dialects
+
+/** Everything that varies per database, in one place: the control-table DDL,
+ * every statement the stores execute (with the dialect's own placeholder
+ * style), transactional-DDL capability and connection-URL normalization.
+ * Implementations are stateless; adding a database = adding one class here and
+ * registering it in Dialects.forDriver — the engine and stores never change.
+ *
+ * Statements take the table name as a parameter because both control tables
+ * (JOO_MIGRATIONS_HISTORY / JOO_MIGRATIONS_LOCK by default) are configurable. */
+pub interface Dialect {
+
+	/** The dialect's canonical name ("postgres", "mysql", "sqlite"). */
+	pub string name()
+
+	/** Whether DDL participates in transactions. PostgreSQL and SQLite roll
+	 * back DDL with the transaction; MySQL/MariaDB commit implicitly on every
+	 * DDL statement, so a migration batch cannot be atomic there (the engine
+	 * falls back to sequential execution with down.sql compensation). */
+	pub boolean supportsTransactionalDdl()
+
+	/** Normalizes a connection URL with the driver options migrations need
+	 * (e.g. MySQL requires multiStatements=true to run a whole script). */
+	pub string normalizeUrl(url string)
+
+	/** CREATE TABLE IF NOT EXISTS for the history table: code (PK), id,
+	 * checksum, applied_at (DB clock default), execution_ms, profile. */
+	pub string createHistoryTable(table string)
+
+	/** CREATE TABLE IF NOT EXISTS for the single-row lock table: id (PK,
+	 * always 1), owner, acquired_at (DB clock default), expires_at (unix
+	 * millis, app-computed so comparisons never depend on the DB clock). */
+	pub string createLockTable(table string)
+
+	/** INSERT of one applied migration: params (code, id, checksum,
+	 * execution_ms, profile). */
+	pub string insertHistory(table string)
+
+	/** DELETE of one applied migration (a down): param (code). */
+	pub string deleteHistory(table string)
+
+	/** SELECT code, id, checksum of every applied migration, ordered by code. */
+	pub string selectApplied(table string)
+
+	/** INSERT of the lock row: params (owner, expires_at). Fails on conflict
+	 * when the lock is already held — that failure IS the contention signal. */
+	pub string insertLock(table string)
+
+	/** SELECT owner, expires_at of the lock row (empty result = free). */
+	pub string selectLock(table string)
+
+	/** Optimistic steal of an expired lock: params (owner, expires_at,
+	 * expected old expires_at) — the WHERE guards against a concurrent steal. */
+	pub string stealLock(table string)
+
+	/** DELETE of the lock row, guarded by owner: param (owner). */
+	pub string releaseLock(table string)
+}
+
+/** Maps a configured driver name to its dialect. The driver name is what the
+ * project registers/configures (db.driver); several drivers may share one
+ * dialect (pgx and lib/pq are both "postgres"; CockroachDB speaks postgres;
+ * MariaDB speaks mysql). */
+pub class Dialects {
+
+	/** Resolves the dialect for a driver name.
+	 * @param driver the configured db.driver value
+	 * @return the dialect, or an error listing the supported drivers */
+	pub static (Dialect, exception) forDriver(driver string) {
+		var normalized = driver.toLower()
+		if (normalized == "postgres" || normalized == "postgresql" || normalized == "pgx"
+			|| normalized == "cockroach" || normalized == "cockroachdb") {
+			return PostgresDialect.new(), Exceptions.NULL
+		}
+		if (normalized == "mysql" || normalized == "mariadb") {
+			return MysqlDialect.new(), Exceptions.NULL
+		}
+		if (normalized == "sqlite" || normalized == "sqlite3") {
+			return SqliteDialect.new(), Exceptions.NULL
+		}
+		return null, Exceptions.new(
+			"unsupported db.driver '${driver}' (supported: postgres/postgresql/pgx/cockroachdb, mysql/mariadb, sqlite/sqlite3)")
+	}
+}

@@ -1,6 +1,6 @@
 # joo-migrator
 
-SQL schema migrations for [joo](https://github.com/joolang/joo) projects:
+SQL schema migrations for [joo](https://github.com/nandolang/joo) projects:
 versioned `up`/`down` migrations under `resources/migrations`, profile-aware
 metadata, transactional batches, a cross-instance lock, and a checksum-verified
 history ledger. Written 100% in joo.
@@ -16,7 +16,7 @@ Two modes, one engine:
 ## Install
 
 ```
-joo install github.com/joolang/joo-migrator
+joo install github.com/nandolang/joo-migrator
 ```
 
 Database drivers are **provided by the consuming project** — the migrator is

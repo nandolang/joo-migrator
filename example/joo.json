@@ -5,7 +5,7 @@
 	"main": "src/main.joo",
 	"deps": {
 		"joo": {
-			"github.com/joolang/joo-migrator": "v0.1.0"
+			"github.com/nandolang/joo-migrator": "v0.1.0"
 		},
 		"go": {
 			"modernc.org/sqlite": "v1.53.0"

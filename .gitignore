@@ -2,3 +2,4 @@ bin/
 .joo-out/
 .out/
 *.exe
+*.db

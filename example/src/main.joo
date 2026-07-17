@@ -16,6 +16,7 @@ pub class Main {
 			// a non-zero exit: orchestrators must see the failed boot
 			log.error("migrations failed, refusing to start: {}", err)
 			Os.exit(1)
+			return
 		}
 		if (Lists.isEmpty(result.getExecuted())) {
 			log.info("schema is current")

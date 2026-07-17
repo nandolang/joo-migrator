@@ -1,0 +1,3 @@
+# LF everywhere: joo tooling compares generated output byte for byte;
+# a CRLF-normalizing checkout must never rewrite sources or fixtures.
+* text=auto eol=lf

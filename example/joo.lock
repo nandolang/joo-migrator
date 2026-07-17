@@ -1,0 +1,12 @@
+{
+	"joo": {
+		"github.com/nandolang/joo-migrator": {
+			"version": "v0.1.0",
+			"commit": "f2b5b4876d80c56bdb0a7d0499054c6bf3f87bec"
+		}
+	},
+	"go": {
+		"modernc.org/sqlite": "v1.53.0",
+		"sigs.k8s.io/yaml": "v1.6.0"
+	}
+}

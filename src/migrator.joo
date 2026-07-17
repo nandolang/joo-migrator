@@ -1,0 +1,99 @@
+package joolang.migrator
+
+import joolang.migrator.engine.Defaults
+import joolang.migrator.engine.Runner
+import joolang.migrator.engine.RunResult
+import joolang.migrator.engine.RunSettings
+
+/** Fluent overrides for an in-app migration run. Every field starts at the
+ * package default (resources/migrations, JOO_ENV profile, JOO_MIGRATIONS_*
+ * tables, props/env datasource), so a config only names what differs:
+ *
+ * {@code Migrator.runWith(MigratorConfig.new().dir("db/migrations"))} */
+pub class MigratorConfig {
+
+	intr driverName string
+	intr urlValue string
+	intr dirPath string
+	intr profileName string
+	intr historyTableName string
+	intr lockTableName string
+	intr lockTtl long
+
+	pub MigratorConfig() {
+		this.driverName = ""
+		this.urlValue = ""
+		this.dirPath = Defaults.dir()
+		this.profileName = Defaults.profile()
+		this.historyTableName = Defaults.historyTable()
+		this.lockTableName = Defaults.lockTable()
+		this.lockTtl = Defaults.lockTtlMillis()
+	}
+
+	/** Explicit driver; unset defers to db.driver from props/env. */
+	pub MigratorConfig driver(driver string) {
+		this.driverName = driver
+		return this
+	}
+
+	/** Explicit url; unset defers to db.url from props/env. */
+	pub MigratorConfig url(url string) {
+		this.urlValue = url
+		return this
+	}
+
+	/** The migrations folder. */
+	pub MigratorConfig dir(dir string) {
+		this.dirPath = dir
+		return this
+	}
+
+	/** The active profile (replaces the JOO_ENV default, "" included). */
+	pub MigratorConfig profile(profile string) {
+		this.profileName = profile
+		return this
+	}
+
+	pub MigratorConfig historyTable(table string) {
+		this.historyTableName = table
+		return this
+	}
+
+	pub MigratorConfig lockTable(table string) {
+		this.lockTableName = table
+		return this
+	}
+
+	pub MigratorConfig lockTtlMillis(ttl long) {
+		this.lockTtl = ttl
+		return this
+	}
+
+	/** The resolved engine settings this config denotes. */
+	pub RunSettings toSettings() {
+		return RunSettings.new(this.driverName, this.urlValue, this.dirPath,
+			this.profileName, this.historyTableName, this.lockTableName, this.lockTtl)
+	}
+}
+
+/** The in-app entry point (automatic mode): call {@code Migrator.run()} at the
+ * top of main() and the schema is current before the application serves its
+ * first request. The run takes the cross-instance lock, so several instances
+ * booting together migrate exactly once; a failed run returns the error — the
+ * caller decides whether to abort startup (it almost always should). */
+pub class Migrator {
+
+	/** Runs every pending migration with the project's own configuration
+	 * (props/env datasource, resources/migrations, JOO_ENV profile).
+	 * @return the applied migration ids */
+	pub static (RunResult, exception) run() {
+		return Migrator.runWith(MigratorConfig.new())
+	}
+
+	/** Runs every pending migration with explicit overrides.
+	 * @param config the overrides (unset fields keep the defaults)
+	 * @return the applied migration ids */
+	pub static (RunResult, exception) runWith(config MigratorConfig) {
+		return Runner.up(config.toSettings())
+	}
+}

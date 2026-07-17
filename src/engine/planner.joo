@@ -1,0 +1,170 @@
+package joolang.migrator.engine
+
+import std.collections.Lists
+import std.collections.Maps
+import joolang.migrator.discovery.Migration
+import joolang.migrator.discovery.MetaRules
+import joolang.migrator.stores.AppliedMigration
+
+/** Pure planning decisions: discovered folders × applied history × active
+ * profile → an ordered, validated Plan. No I/O and no SQL here — every rule is
+ * deterministic and unit-testable, and the Executor trusts the plans this
+ * class produces (single validation point). */
+pub class Planner {
+
+	/** Plans an up run: pending = discovered, not yet applied, active under the
+	 * profile — in ascending code order. Checksum drift on an applied migration
+	 * is an error: the ledger would no longer describe the database.
+	 *
+	 * A pending code BELOW an already-applied code is allowed on purpose:
+	 * profile-scoped migrations legitimately fill such gaps (a dev-only seed
+	 * skipped in prod stays pending forever there, while later migrations
+	 * apply). Execution order stays strictly ascending within each run.
+	 * @param discovered every migration on disk, ordered by code
+	 * @param applied the history ledger
+	 * @param profile the active profile ("" when none)
+	 * @return the up plan */
+	pub static (Plan, exception) up(discovered []Migration, applied []AppliedMigration, profile string) {
+		var recorded = Planner.checksumsByCode(applied)
+		var derr = Planner.checkDrift(discovered, recorded)
+		if (Exceptions.eval(derr)) {
+			return null, derr
+		}
+		var steps []Migration = []Migration{}
+		for (var m : discovered) {
+			if (Maps.has(recorded, m.getCode())) {
+				continue
+			}
+			if (!MetaRules.runsIn(m.getMeta(), profile)) {
+				continue
+			}
+			steps = append(steps, m)
+		}
+		return Plan.new(steps, profile), Exceptions.NULL
+	}
+
+	/** Plans a down run over the LEDGER, deliberately profile-agnostic:
+	 * reverting is an explicit operator action on what IS applied, whatever
+	 * profile applied it — filtering here would silently strand rows.
+	 *
+	 * `toCode >= 0` reverts every applied migration with a code above it (the
+	 * target itself stays applied); otherwise the last `steps` applied
+	 * migrations are reverted. The plan is in descending code order. Every
+	 * selected migration must still exist on disk with a non-empty down.sql —
+	 * an empty one marks a consciously irreversible change, and "reverting" it
+	 * would only erase the ledger row while the schema change stays.
+	 * @param discovered every migration on disk, ordered by code
+	 * @param applied the history ledger, ordered by code
+	 * @param steps how many applied migrations to revert (used when toCode < 0)
+	 * @param toCode revert down to (and excluding) this code; -1 = use steps
+	 * @param profile the active profile, recorded on the plan for reporting
+	 * @return the down plan */
+	pub static (Plan, exception) down(discovered []Migration, applied []AppliedMigration,
+			steps int, toCode int, profile string) {
+		var derr = Planner.checkDrift(discovered, Planner.checksumsByCode(applied))
+		if (Exceptions.eval(derr)) {
+			return null, derr
+		}
+		if (toCode < 0 && steps <= 0) {
+			return null, Exceptions.new("a down needs --steps above zero or a --to target")
+		}
+		var byCode = Planner.indexByCode(discovered)
+		var selected []Migration = []Migration{}
+		var i = Lists.length(applied) - 1
+		while (i >= 0) {
+			var row = applied[i]
+			var code = row.getCode() as int
+			if (toCode >= 0 && code <= toCode) {
+				break
+			}
+			if (toCode < 0 && Lists.length(selected) >= steps) {
+				break
+			}
+			if (!Maps.has(byCode, code)) {
+				return null, Exceptions.new(
+					"cannot revert '${row.getId()}': its folder is gone from disk (the down.sql IS the revert script)")
+			}
+			var m = discovered[Maps.getOr(byCode, code, -1)]
+			if (m.getDownSql() == "") {
+				return null, Exceptions.new(
+					"cannot revert '${m.getId()}': its down.sql is empty (a consciously irreversible migration)")
+			}
+			selected = append(selected, m)
+			i = i - 1
+		}
+		return Plan.new(selected, profile), Exceptions.NULL
+	}
+
+	/** The merged status view, ordered by code: every discovered migration with
+	 * its state under the profile, plus ledger entries whose folder is gone
+	 * from disk. Drift is reported as a state here (status is a diagnostic
+	 * command), while up()/down() refuse to run over it. */
+	pub static []StatusEntry status(discovered []Migration, applied []AppliedMigration, profile string) {
+		var recorded = Planner.checksumsByCode(applied)
+		var onDisk = Planner.indexByCode(discovered)
+		var entries []StatusEntry = []StatusEntry{}
+		for (var m : discovered) {
+			entries = append(entries, StatusEntry.new(
+				m.getCode(), m.getId(), Planner.stateOf(m, recorded, profile), m.getMeta().getDescription()))
+		}
+		for (var row : applied) {
+			if (!Maps.has(onDisk, row.getCode() as int)) {
+				entries = append(entries, StatusEntry.new(
+					row.getCode() as int, row.getId(), "missing (applied but not on disk)", ""))
+			}
+		}
+		return Lists.sort(entries, (a, b) -> a.getCode() - b.getCode())
+	}
+
+	// stateOf classifies one discovered migration against the ledger and the
+	// active profile.
+	intr static string stateOf(m Migration, recorded map[int]string, profile string) {
+		if (Maps.has(recorded, m.getCode())) {
+			if (Maps.getOr(recorded, m.getCode(), "") != m.getChecksum()) {
+				return "drifted (up.sql changed after apply)"
+			}
+			return "applied"
+		}
+		if (!MetaRules.runsIn(m.getMeta(), profile)) {
+			return "skipped (profile)"
+		}
+		return "pending"
+	}
+
+	// checkDrift fails when an applied migration's up.sql changed on disk —
+	// editing an applied migration always calls for a NEW one instead.
+	intr static exception checkDrift(discovered []Migration, recorded map[int]string) {
+		for (var m : discovered) {
+			if (!Maps.has(recorded, m.getCode())) {
+				continue
+			}
+			if (Maps.getOr(recorded, m.getCode(), "") != m.getChecksum()) {
+				return Exceptions.new(
+					"migration '${m.getId()}' changed after it was applied (checksum drift); " +
+					"create a new migration instead of editing an applied one")
+			}
+		}
+		return Exceptions.NULL
+	}
+
+	// checksumsByCode indexes the ledger: code → recorded up.sql checksum
+	// (presence = applied; sha256 is never empty, so "" stays a safe fallback).
+	intr static map[int]string checksumsByCode(applied []AppliedMigration) {
+		var recorded = map[int]string{}
+		for (var row : applied) {
+			recorded[row.getCode() as int] = row.getChecksum()
+		}
+		return recorded
+	}
+
+	// indexByCode indexes discovered migrations: code → position in the list.
+	intr static map[int]int indexByCode(discovered []Migration) {
+		var byCode = map[int]int{}
+		var i = 0
+		for (var m : discovered) {
+			byCode[m.getCode()] = i
+			i = i + 1
+		}
+		return byCode
+	}
+}

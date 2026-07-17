@@ -1,0 +1,223 @@
+package joolang.migrator.engine
+
+import std.collections.Lists
+import std.sql.Db
+import std.time.Instant
+import joolang.migrator.dialects.Dialect
+import joolang.migrator.discovery.Migration
+import joolang.migrator.stores.HistoryStore
+
+/** Executes a validated Plan over an open connection. Two strategies, chosen
+ * by the dialect's transactional-DDL capability:
+ *
+ * - PostgreSQL/SQLite: ONE transaction wraps the whole batch — history writes
+ *   included — so ten migrations with the last one failing leave the database
+ *   exactly as it was.
+ * - MySQL/MariaDB: DDL commits implicitly, so batch atomicity is impossible.
+ *   Migrations run sequentially, and a failure triggers best-effort down.sql
+ *   compensation of the batch in reverse order, with every outcome folded
+ *   into the returned error — the operator must know exactly what state the
+ *   database was left in. */
+pub class Executor {
+
+	/** Runs an up plan.
+	 * @param db the migration connection
+	 * @param dialect the datasource's dialect
+	 * @param historyTable the ledger table name
+	 * @param plan a Planner-validated up plan
+	 * @return the executed migration ids */
+	pub static (RunResult, exception) up(db Db, dialect Dialect, historyTable string, plan Plan) {
+		if (Lists.isEmpty(plan.getSteps())) {
+			return RunResult.new([]string{}), Exceptions.NULL
+		}
+		if (dialect.supportsTransactionalDdl()) {
+			return Executor.upTransactional(db, dialect, historyTable, plan)
+		}
+		return Executor.upSequential(db, dialect, historyTable, plan)
+	}
+
+	/** Runs a down plan (steps already in descending code order). Reverts are
+	 * transactional where the dialect allows; on MySQL a mid-batch failure
+	 * stops the run, reporting what was already reverted. */
+	pub static (RunResult, exception) down(db Db, dialect Dialect, historyTable string, plan Plan) {
+		if (Lists.isEmpty(plan.getSteps())) {
+			return RunResult.new([]string{}), Exceptions.NULL
+		}
+		if (dialect.supportsTransactionalDdl()) {
+			return Executor.downTransactional(db, dialect, historyTable, plan)
+		}
+		return Executor.downSequential(db, dialect, historyTable, plan)
+	}
+
+	// upTransactional: the whole batch in one transaction; any failure rolls
+	// everything back, ledger rows included. db.transaction (not a manual
+	// begin/commit) so a driver panic mid-batch still rolls back and frees the
+	// pool's single connection — an abandoned Tx would deadlock the lock
+	// release that follows.
+	intr static (RunResult, exception) upTransactional(db Db, dialect Dialect,
+			historyTable string, plan Plan) {
+		var terr = db.transaction(tx -> {
+			for (var m : plan.getSteps()) {
+				var started = Instant.now().epochMillis()
+				var _, uerr = tx.exec(m.getUpSql())
+				if (Exceptions.eval(uerr)) {
+					return Exceptions.merge(uerr,
+						"migration '${m.getId()}' failed; the whole batch was rolled back")
+				}
+				var herr = HistoryStore.add(tx, dialect, historyTable, m.getCode() as long,
+					m.getId(), m.getChecksum(), Instant.now().epochMillis() - started, plan.getProfile())
+				if (Exceptions.eval(herr)) {
+					return Exceptions.merge(herr,
+						"recording migration '${m.getId()}' failed; the whole batch was rolled back")
+				}
+			}
+			return Exceptions.NULL
+		})
+		if (Exceptions.eval(terr)) {
+			return null, terr
+		}
+		// all-or-nothing: a committed batch executed exactly the whole plan
+		return RunResult.new(Executor.planIds(plan)), Exceptions.NULL
+	}
+
+	// upSequential: no transactional DDL — each migration lands on its own; a
+	// failure compensates the batch (the half-applied failing migration
+	// included: its down.sql runs first and should tolerate a partial apply).
+	intr static (RunResult, exception) upSequential(db Db, dialect Dialect,
+			historyTable string, plan Plan) {
+		var executed []string = []string{}
+		var done []Migration = []Migration{}
+		for (var m : plan.getSteps()) {
+			var started = Instant.now().epochMillis()
+			var _, uerr = db.exec(m.getUpSql())
+			if (Exceptions.eval(uerr)) {
+				return null, Executor.compensate(db, dialect, historyTable, append(done, m),
+					Exceptions.merge(uerr, "migration '${m.getId()}' failed"))
+			}
+			var herr = Executor.addLedgerRow(db, dialect, historyTable, m,
+				Instant.now().epochMillis() - started, plan.getProfile())
+			if (Exceptions.eval(herr)) {
+				return null, Executor.compensate(db, dialect, historyTable, append(done, m),
+					Exceptions.merge(herr, "recording migration '${m.getId()}' failed"))
+			}
+			done = append(done, m)
+			executed = append(executed, m.getId())
+		}
+		return RunResult.new(executed), Exceptions.NULL
+	}
+
+	// compensate best-effort reverts this batch in reverse order. It keeps
+	// going past individual failures (later steps are often independent), only
+	// erasing a ledger row once its down.sql succeeded — a failed revert stays
+	// recorded as applied, which it still is.
+	intr static exception compensate(db Db, dialect Dialect, historyTable string,
+			batch []Migration, cause exception) {
+		var err = cause
+		var i = Lists.length(batch) - 1
+		while (i >= 0) {
+			var m = batch[i]
+			i = i - 1
+			if (m.getDownSql() == "") {
+				err = Exceptions.merge(err,
+					"compensation skipped '${m.getId()}': empty down.sql (irreversible)")
+				continue
+			}
+			var _, derr = db.exec(m.getDownSql())
+			if (Exceptions.eval(derr)) {
+				err = Exceptions.merge(err, "compensating '${m.getId()}' failed: ${derr}")
+				continue
+			}
+			var rerr = Executor.removeLedgerRow(db, dialect, historyTable, m.getCode() as long)
+			if (Exceptions.eval(rerr)) {
+				err = Exceptions.merge(err,
+					"'${m.getId()}' was reverted but its ledger row remains: ${rerr}")
+			}
+		}
+		return Exceptions.merge(err,
+			"this dialect cannot roll back DDL; the batch was compensated with down.sql (best effort)")
+	}
+
+	// downTransactional: the whole revert in one transaction (db.transaction —
+	// panic-safe, see upTransactional).
+	intr static (RunResult, exception) downTransactional(db Db, dialect Dialect,
+			historyTable string, plan Plan) {
+		var terr = db.transaction(tx -> {
+			for (var m : plan.getSteps()) {
+				var _, derr = tx.exec(m.getDownSql())
+				if (Exceptions.eval(derr)) {
+					return Exceptions.merge(derr,
+						"reverting '${m.getId()}' failed; the whole down was rolled back")
+				}
+				var herr = HistoryStore.remove(tx, dialect, historyTable, m.getCode() as long)
+				if (Exceptions.eval(herr)) {
+					return Exceptions.merge(herr,
+						"unrecording '${m.getId()}' failed; the whole down was rolled back")
+				}
+			}
+			return Exceptions.NULL
+		})
+		if (Exceptions.eval(terr)) {
+			return null, terr
+		}
+		// all-or-nothing: a committed down reverted exactly the whole plan
+		return RunResult.new(Executor.planIds(plan)), Exceptions.NULL
+	}
+
+	// downSequential: reverts one by one; a failure stops the run and reports
+	// how far it got (no compensation — re-applying an up to undo a failed
+	// down would compound the damage).
+	intr static (RunResult, exception) downSequential(db Db, dialect Dialect,
+			historyTable string, plan Plan) {
+		var executed []string = []string{}
+		for (var m : plan.getSteps()) {
+			var _, derr = db.exec(m.getDownSql())
+			if (Exceptions.eval(derr)) {
+				return null, Exceptions.merge(derr,
+					"reverting '${m.getId()}' failed after ${Lists.length(executed)} successful revert(s): ${Executor.joined(executed)}")
+			}
+			var rerr = Executor.removeLedgerRow(db, dialect, historyTable, m.getCode() as long)
+			if (Exceptions.eval(rerr)) {
+				return null, Exceptions.merge(rerr,
+					"'${m.getId()}' was reverted but its ledger row remains")
+			}
+			executed = append(executed, m.getId())
+		}
+		return RunResult.new(executed), Exceptions.NULL
+	}
+
+	// addLedgerRow writes one ledger row in its own small panic-safe
+	// transaction (the sequential strategy has no batch transaction to ride).
+	intr static exception addLedgerRow(db Db, dialect Dialect, historyTable string,
+			m Migration, executionMs long, profile string) {
+		return db.transaction(tx -> {
+			return HistoryStore.add(tx, dialect, historyTable, m.getCode() as long,
+				m.getId(), m.getChecksum(), executionMs, profile)
+		})
+	}
+
+	// removeLedgerRow removes one ledger row in its own small panic-safe
+	// transaction.
+	intr static exception removeLedgerRow(db Db, dialect Dialect, historyTable string, code long) {
+		return db.transaction(tx -> {
+			return HistoryStore.remove(tx, dialect, historyTable, code)
+		})
+	}
+
+	// planIds lists a plan's migration ids in plan order.
+	intr static []string planIds(plan Plan) {
+		var ids []string = []string{}
+		for (var m : plan.getSteps()) {
+			ids = append(ids, m.getId())
+		}
+		return ids
+	}
+
+	// joined renders executed ids for failure reports.
+	intr static string joined(ids []string) {
+		var out = ""
+		for (var id : ids) {
+			out = out == "" ? id : "${out}, ${id}"
+		}
+		return out == "" ? "none" : out
+	}
+}

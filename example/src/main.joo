@@ -1,0 +1,29 @@
+package main
+
+import std.collections.Lists
+import std.os.Os
+import joolang.migrator.Migrator
+
+/** The automatic mode in its natural habitat: migrations run before anything
+ * else, and a failed run aborts startup — the application never serves
+ * requests over a half-migrated schema. The datasource comes from
+ * resources/properties.json (db.driver/db.url), exactly what the app uses. */
+pub class Main {
+
+	pub static void main(args []string) {
+		var result, err = Migrator.run()
+		if (Exceptions.eval(err)) {
+			// a non-zero exit: orchestrators must see the failed boot
+			log.error("migrations failed, refusing to start: {}", err)
+			Os.exit(1)
+		}
+		if (Lists.isEmpty(result.getExecuted())) {
+			log.info("schema is current")
+		} else {
+			log.info("schema migrated: {} applied", Lists.length(result.getExecuted()))
+		}
+
+		// ... the application starts here
+		log.info("example app up")
+	}
+}

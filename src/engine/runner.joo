@@ -1,0 +1,269 @@
+package joolang.migrator.engine
+
+import std.sql.Db
+import joolang.migrator.dialects.Dialect
+import joolang.migrator.dialects.Dialects
+import joolang.migrator.discovery.Migration
+import joolang.migrator.discovery.Scanner
+import joolang.migrator.stores.Connector
+import joolang.migrator.stores.HistoryStore
+import joolang.migrator.stores.LockManager
+
+/** Everything a run needs, fully resolved: the in-app facade and the CLI both
+ * build one of these (via Defaults), then hand it to the Runner. */
+pub record RunSettings {
+	/** Explicit driver; "" defers to the props/env ladder. */
+	intr driver string: [getter]
+	/** Explicit url; "" defers to the props/env ladder. */
+	intr url string: [getter]
+	/** The migrations folder. */
+	intr dir string: [getter]
+	/** The active profile ("" when none). */
+	intr profile string: [getter]
+	intr historyTable string: [getter]
+	intr lockTable string: [getter]
+	intr lockTtlMillis long: [getter]
+}
+
+/** An open migration session: the capped connection and its dialect. */
+pub class Session {
+
+	intr db Db
+	intr dialect Dialect
+
+	pub Session(@Final db Db, @Final dialect Dialect) {
+		this.db = db
+		this.dialect = dialect
+	}
+
+	pub Db getDb() {
+		return this.db
+	}
+
+	pub Dialect getDialect() {
+		return this.dialect
+	}
+}
+
+/** The full command flows — scan → connect → ensure → lock → plan → execute —
+ * with the two guarantees this package promises whatever fails in between,
+ * panics included (every session runs under `recover`):
+ * the lock is ALWAYS released and the connection is ALWAYS closed. */
+pub class Runner {
+
+	/** Applies every pending migration.
+	 * @param settings the resolved run settings
+	 * @return the executed migration ids */
+	pub static (RunResult, exception) up(settings RunSettings) {
+		var discovered, serr = Scanner.scan(settings.getDir())
+		if (Exceptions.eval(serr)) {
+			return null, serr
+		}
+		var session, oerr = Runner.open(settings)
+		if (Exceptions.eval(oerr)) {
+			return null, oerr
+		}
+		var result, rerr = recover Runner.upConnected(session, settings, discovered)
+		Runner.closeSession(session)
+		if (Exceptions.eval(rerr)) {
+			return null, rerr
+		}
+		return result, Exceptions.NULL
+	}
+
+	/** Reverts applied migrations: the last `steps` ones, or — when
+	 * `toCode >= 0` — every one with a code above `toCode`.
+	 * @param settings the resolved run settings
+	 * @param steps how many applied migrations to revert (used when toCode < 0)
+	 * @param toCode revert down to (and excluding) this code; -1 = use steps
+	 * @return the reverted migration ids */
+	pub static (RunResult, exception) down(settings RunSettings, steps int, toCode int) {
+		var discovered, serr = Scanner.scan(settings.getDir())
+		if (Exceptions.eval(serr)) {
+			return null, serr
+		}
+		var session, oerr = Runner.open(settings)
+		if (Exceptions.eval(oerr)) {
+			return null, oerr
+		}
+		var result, rerr = recover Runner.downConnected(session, settings, discovered, steps, toCode)
+		Runner.closeSession(session)
+		if (Exceptions.eval(rerr)) {
+			return null, rerr
+		}
+		return result, Exceptions.NULL
+	}
+
+	/** The status report: every migration's state under the active profile.
+	 * Read-only — no lock is taken.
+	 * @param settings the resolved run settings
+	 * @return the entries, ordered by code */
+	pub static ([]StatusEntry, exception) status(settings RunSettings) {
+		var discovered, serr = Scanner.scan(settings.getDir())
+		if (Exceptions.eval(serr)) {
+			return []StatusEntry{}, serr
+		}
+		var session, oerr = Runner.open(settings)
+		if (Exceptions.eval(oerr)) {
+			return []StatusEntry{}, oerr
+		}
+		var entries, rerr = recover Runner.statusConnected(session, settings, discovered)
+		Runner.closeSession(session)
+		if (Exceptions.eval(rerr)) {
+			return []StatusEntry{}, rerr
+		}
+		return entries, Exceptions.NULL
+	}
+
+	/** Validates without executing: the folder layout and metadata parse
+	 * (scan) and the ledger agrees with the disk (checksum drift).
+	 * @param settings the resolved run settings
+	 * @return null when everything checks out */
+	pub static exception validate(settings RunSettings) {
+		var discovered, serr = Scanner.scan(settings.getDir())
+		if (Exceptions.eval(serr)) {
+			return serr
+		}
+		var session, oerr = Runner.open(settings)
+		if (Exceptions.eval(oerr)) {
+			return oerr
+		}
+		var verr = recover Runner.validateConnected(session, settings, discovered)
+		Runner.closeSession(session)
+		return verr
+	}
+
+	// closeSession closes the migration connection, warning on failure — a
+	// teardown problem must be visible, but never overrides the run's outcome.
+	intr static void closeSession(session Session) {
+		var cerr = session.getDb().close()
+		if (Exceptions.eval(cerr)) {
+			log.warn("closing the migration connection failed: {}", cerr)
+		}
+	}
+
+	// open resolves the datasource coordinates, its dialect, and the capped
+	// migration connection.
+	intr static (Session, exception) open(settings RunSettings) {
+		var source, rerr = Connector.resolve(settings.getDriver(), settings.getUrl())
+		if (Exceptions.eval(rerr)) {
+			return null, rerr
+		}
+		var dialect, derr = Dialects.forDriver(source.getDriver())
+		if (Exceptions.eval(derr)) {
+			return null, derr
+		}
+		var db, oerr = Connector.open(source, dialect)
+		if (Exceptions.eval(oerr)) {
+			return null, oerr
+		}
+		return Session.new(db, dialect), Exceptions.NULL
+	}
+
+	// upConnected: ensure the ledger, acquire the lock, run the locked part.
+	// The lock is released on every path; a failed release after a finished
+	// run only warns — the lock self-frees after the ttl, and failing a
+	// successful migration run over it would abort app startup for nothing.
+	intr static (RunResult, exception) upConnected(session Session, settings RunSettings,
+			discovered []Migration) {
+		var db = session.getDb()
+		var dialect = session.getDialect()
+		var herr = HistoryStore.ensure(db, dialect, settings.getHistoryTable())
+		if (Exceptions.eval(herr)) {
+			return null, herr
+		}
+		var owner, aerr = LockManager.acquire(db, dialect, settings.getLockTable(), settings.getLockTtlMillis())
+		if (Exceptions.eval(aerr)) {
+			return null, aerr
+		}
+		var result, rerr = recover Runner.upLocked(session, settings, discovered)
+		var lerr = LockManager.release(db, dialect, settings.getLockTable(), owner)
+		if (Exceptions.eval(lerr)) {
+			log.warn("migration lock release failed (it self-frees after the ttl): {}", lerr)
+		}
+		if (Exceptions.eval(rerr)) {
+			return null, rerr
+		}
+		return result, Exceptions.NULL
+	}
+
+	// upLocked: the critical section — the ledger read and the execution
+	// happen strictly under the lock, so a concurrently booting instance can
+	// never plan against a stale ledger.
+	intr static (RunResult, exception) upLocked(session Session, settings RunSettings,
+			discovered []Migration) {
+		var applied, aerr = HistoryStore.applied(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(aerr)) {
+			return null, aerr
+		}
+		var plan, perr = Planner.up(discovered, applied, settings.getProfile())
+		if (Exceptions.eval(perr)) {
+			return null, perr
+		}
+		return Executor.up(session.getDb(), session.getDialect(), settings.getHistoryTable(), plan)
+	}
+
+	// downConnected mirrors upConnected's lock discipline for reverts.
+	intr static (RunResult, exception) downConnected(session Session, settings RunSettings,
+			discovered []Migration, steps int, toCode int) {
+		var db = session.getDb()
+		var dialect = session.getDialect()
+		var herr = HistoryStore.ensure(db, dialect, settings.getHistoryTable())
+		if (Exceptions.eval(herr)) {
+			return null, herr
+		}
+		var owner, aerr = LockManager.acquire(db, dialect, settings.getLockTable(), settings.getLockTtlMillis())
+		if (Exceptions.eval(aerr)) {
+			return null, aerr
+		}
+		var result, rerr = recover Runner.downLocked(session, settings, discovered, steps, toCode)
+		var lerr = LockManager.release(db, dialect, settings.getLockTable(), owner)
+		if (Exceptions.eval(lerr)) {
+			log.warn("migration lock release failed (it self-frees after the ttl): {}", lerr)
+		}
+		if (Exceptions.eval(rerr)) {
+			return null, rerr
+		}
+		return result, Exceptions.NULL
+	}
+
+	intr static (RunResult, exception) downLocked(session Session, settings RunSettings,
+			discovered []Migration, steps int, toCode int) {
+		var applied, aerr = HistoryStore.applied(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(aerr)) {
+			return null, aerr
+		}
+		var plan, perr = Planner.down(discovered, applied, steps, toCode, settings.getProfile())
+		if (Exceptions.eval(perr)) {
+			return null, perr
+		}
+		return Executor.down(session.getDb(), session.getDialect(), settings.getHistoryTable(), plan)
+	}
+
+	intr static ([]StatusEntry, exception) statusConnected(session Session, settings RunSettings,
+			discovered []Migration) {
+		var herr = HistoryStore.ensure(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(herr)) {
+			return []StatusEntry{}, herr
+		}
+		var applied, aerr = HistoryStore.applied(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(aerr)) {
+			return []StatusEntry{}, aerr
+		}
+		return Planner.status(discovered, applied, settings.getProfile()), Exceptions.NULL
+	}
+
+	intr static exception validateConnected(session Session, settings RunSettings,
+			discovered []Migration) {
+		var herr = HistoryStore.ensure(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(herr)) {
+			return herr
+		}
+		var applied, aerr = HistoryStore.applied(session.getDb(), session.getDialect(), settings.getHistoryTable())
+		if (Exceptions.eval(aerr)) {
+			return aerr
+		}
+		var _, perr = Planner.up(discovered, applied, settings.getProfile())
+		return perr
+	}
+}

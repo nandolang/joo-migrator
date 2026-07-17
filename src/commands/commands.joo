@@ -1,0 +1,214 @@
+package joolang.migrator.commands
+
+import std.cli.Command
+import std.cli.Flag
+import std.cli.Arg
+import std.cli.Console
+import std.collections.Lists
+import joolang.migrator.engine.Defaults
+import joolang.migrator.engine.Runner
+
+// The five migrator commands (manual mode). Each declares the shared
+// datasource/layout flags — std.cli binds flags per command class, so the
+// repetition is the feature's shape — and folds them through CliSettings, the
+// single flag-to-settings mapping. Results go to stdout (log), errors to
+// stderr (Console.error) with exit code 1.
+
+/** `migrator up` — apply every pending migration. */
+@Command(name = "up", help = "Apply every pending migration")
+pub class UpCmd {
+
+	@Flag(name = "driver", help = "database driver (default: db.driver from props/env)")
+	pub driver string = ""
+
+	@Flag(name = "url", help = "database url (default: db.url from props/env)")
+	pub url string = ""
+
+	@Flag(name = "dir", help = "migrations folder (default: resources/migrations)")
+	pub dir string = ""
+
+	@Flag(name = "profile", help = "active profile (default: JOO_ENV)")
+	pub profile string = ""
+
+	@Flag(name = "history-table", help = "history table name (default: JOO_MIGRATIONS_HISTORY)")
+	pub historyTable string = ""
+
+	@Flag(name = "lock-table", help = "lock table name (default: JOO_MIGRATIONS_LOCK)")
+	pub lockTable string = ""
+
+	@Flag(name = "lock-ttl-seconds", help = "lock time-to-live in seconds (default: 900)")
+	pub lockTtlSeconds long = 0
+
+	pub int run() {
+		var result, err = Runner.up(CliSettings.build(driver, url, dir, profile,
+			historyTable, lockTable, lockTtlSeconds))
+		if (Exceptions.eval(err)) {
+			Console.error("up failed: ${err}")
+			return 1
+		}
+		if (Lists.isEmpty(result.getExecuted())) {
+			log.info("nothing to migrate: the database is up to date")
+			return 0
+		}
+		for (var id : result.getExecuted()) {
+			log.info("applied {}", id)
+		}
+		log.info("{} migration(s) applied", Lists.length(result.getExecuted()))
+		return 0
+	}
+}
+
+/** `migrator down` — revert applied migrations, newest first. */
+@Command(name = "down", help = "Revert applied migrations (newest first)")
+pub class DownCmd {
+
+	@Flag(name = "steps", help = "how many applied migrations to revert")
+	pub steps int = 1
+
+	@Flag(name = "to", help = "revert everything above this code (wins over --steps)")
+	pub to int = -1
+
+	@Flag(name = "driver", help = "database driver (default: db.driver from props/env)")
+	pub driver string = ""
+
+	@Flag(name = "url", help = "database url (default: db.url from props/env)")
+	pub url string = ""
+
+	@Flag(name = "dir", help = "migrations folder (default: resources/migrations)")
+	pub dir string = ""
+
+	@Flag(name = "profile", help = "active profile (default: JOO_ENV)")
+	pub profile string = ""
+
+	@Flag(name = "history-table", help = "history table name (default: JOO_MIGRATIONS_HISTORY)")
+	pub historyTable string = ""
+
+	@Flag(name = "lock-table", help = "lock table name (default: JOO_MIGRATIONS_LOCK)")
+	pub lockTable string = ""
+
+	@Flag(name = "lock-ttl-seconds", help = "lock time-to-live in seconds (default: 900)")
+	pub lockTtlSeconds long = 0
+
+	pub int run() {
+		var result, err = Runner.down(CliSettings.build(driver, url, dir, profile,
+			historyTable, lockTable, lockTtlSeconds), steps, to)
+		if (Exceptions.eval(err)) {
+			Console.error("down failed: ${err}")
+			return 1
+		}
+		if (Lists.isEmpty(result.getExecuted())) {
+			log.info("nothing to revert")
+			return 0
+		}
+		for (var id : result.getExecuted()) {
+			log.info("reverted {}", id)
+		}
+		log.info("{} migration(s) reverted", Lists.length(result.getExecuted()))
+		return 0
+	}
+}
+
+/** `migrator status` — every migration's state under the active profile. */
+@Command(name = "status", help = "Show every migration's state")
+pub class StatusCmd {
+
+	@Flag(name = "driver", help = "database driver (default: db.driver from props/env)")
+	pub driver string = ""
+
+	@Flag(name = "url", help = "database url (default: db.url from props/env)")
+	pub url string = ""
+
+	@Flag(name = "dir", help = "migrations folder (default: resources/migrations)")
+	pub dir string = ""
+
+	@Flag(name = "profile", help = "active profile (default: JOO_ENV)")
+	pub profile string = ""
+
+	@Flag(name = "history-table", help = "history table name (default: JOO_MIGRATIONS_HISTORY)")
+	pub historyTable string = ""
+
+	@Flag(name = "lock-table", help = "lock table name (default: JOO_MIGRATIONS_LOCK)")
+	pub lockTable string = ""
+
+	@Flag(name = "lock-ttl-seconds", help = "lock time-to-live in seconds (default: 900)")
+	pub lockTtlSeconds long = 0
+
+	pub int run() {
+		var entries, err = Runner.status(CliSettings.build(driver, url, dir, profile,
+			historyTable, lockTable, lockTtlSeconds))
+		if (Exceptions.eval(err)) {
+			Console.error("status failed: ${err}")
+			return 1
+		}
+		if (Lists.isEmpty(entries)) {
+			log.info("no migrations found")
+			return 0
+		}
+		for (var e : entries) {
+			if (e.getDescription() == "") {
+				log.info("[{}] {}", e.getState(), e.getId())
+			} else {
+				log.info("[{}] {} — {}", e.getState(), e.getId(), e.getDescription())
+			}
+		}
+		return 0
+	}
+}
+
+/** `migrator validate` — check the tree and the ledger without executing. */
+@Command(name = "validate", help = "Validate migrations against the ledger without executing")
+pub class ValidateCmd {
+
+	@Flag(name = "driver", help = "database driver (default: db.driver from props/env)")
+	pub driver string = ""
+
+	@Flag(name = "url", help = "database url (default: db.url from props/env)")
+	pub url string = ""
+
+	@Flag(name = "dir", help = "migrations folder (default: resources/migrations)")
+	pub dir string = ""
+
+	@Flag(name = "profile", help = "active profile (default: JOO_ENV)")
+	pub profile string = ""
+
+	@Flag(name = "history-table", help = "history table name (default: JOO_MIGRATIONS_HISTORY)")
+	pub historyTable string = ""
+
+	@Flag(name = "lock-table", help = "lock table name (default: JOO_MIGRATIONS_LOCK)")
+	pub lockTable string = ""
+
+	@Flag(name = "lock-ttl-seconds", help = "lock time-to-live in seconds (default: 900)")
+	pub lockTtlSeconds long = 0
+
+	pub int run() {
+		var err = Runner.validate(CliSettings.build(driver, url, dir, profile,
+			historyTable, lockTable, lockTtlSeconds))
+		if (Exceptions.eval(err)) {
+			Console.error("validation failed: ${err}")
+			return 1
+		}
+		log.info("migrations are valid")
+		return 0
+	}
+}
+
+/** `migrator create <name>` — scaffold the next migration folder. */
+@Command(name = "create", help = "Scaffold the next migration folder (up.sql, down.sql, migration.yml)")
+pub class CreateCmd {
+
+	@Arg(position = 0, help = "the migration name (snake_case)")
+	pub name string
+
+	@Flag(name = "dir", help = "migrations folder (default: resources/migrations)")
+	pub dir string = ""
+
+	pub int run() {
+		var folder, err = Scaffolder.create(dir == "" ? Defaults.dir() : dir, name)
+		if (Exceptions.eval(err)) {
+			Console.error("create failed: ${err}")
+			return 1
+		}
+		log.info("created {}", folder)
+		return 0
+	}
+}

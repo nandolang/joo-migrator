@@ -1,10 +1,22 @@
 package main
 
-// CLI entry point for the manual migration mode. The commands are wired in the
-// final stage; until then this is the compilable skeleton of the package.
+import std.cli.Cli
+import std.os.Os
+import joolang.migrator.commands.UpCmd
+import joolang.migrator.commands.DownCmd
+import joolang.migrator.commands.StatusCmd
+import joolang.migrator.commands.ValidateCmd
+import joolang.migrator.commands.CreateCmd
+
+/** joo-migrator CLI — the manual migration mode, fully decoupled from the
+ * application: run it from the project root (or point --dir/--url anywhere)
+ * to apply, revert, inspect, validate or scaffold migrations. The automatic
+ * mode is the {@code Migrator.run()} facade, called from the application's
+ * own main(). */
 pub class Main {
 
 	pub static void main(args []string) {
-		log.info("joo-migrator: CLI commands land in the final stage")
+		Os.exit(Cli.run(args, UpCmd.class, DownCmd.class, StatusCmd.class,
+			ValidateCmd.class, CreateCmd.class))
 	}
 }

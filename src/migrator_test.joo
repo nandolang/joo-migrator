@@ -1,0 +1,106 @@
+package joolang.migrator
+
+import std.test.Test
+import std.test.Before
+import std.test.After
+import std.test.Assert
+import std.io.Files
+import std.io.Paths
+import std.collections.Lists
+import std.sql.Db
+import joolang.migrator.dialects.SqliteDialect
+import joolang.migrator.stores.Connector
+import joolang.migrator.stores.Datasource
+
+/** A COUNT(*) scan target for verification queries. */
+pub record FacadeCountRow {
+	intr n long: [getter]
+}
+
+// Facade contract: MigratorConfig folds overrides over the package defaults,
+// and Migrator.runWith drives the same engine flow the CLI uses.
+pub class MigratorTest {
+
+	intr root string
+
+	pub MigratorTest() {
+		this.root = ""
+	}
+
+	@Before
+	pub void createScratchRoot() {
+		var root, err = Files.mkdirTemp("", "joo-migrator-facade-*")
+		if (Exceptions.eval(err)) {
+			Assert.fail("mkdirTemp: ${err}")
+			return
+		}
+		this.root = root
+	}
+
+	@After
+	pub void removeScratchRoot() {
+		Files.remove(this.root)
+	}
+
+	@Test
+	pub void configStartsAtDefaultsAndOverridesFluently() {
+		var defaults = MigratorConfig.new().toSettings()
+		Assert.equals("", defaults.getDriver())
+		Assert.equals("", defaults.getUrl())
+		Assert.equals("resources/migrations", defaults.getDir())
+		Assert.equals("JOO_MIGRATIONS_HISTORY", defaults.getHistoryTable())
+		Assert.equals("JOO_MIGRATIONS_LOCK", defaults.getLockTable())
+		Assert.isTrue(defaults.getLockTtlMillis() == 900000)
+
+		var overridden = (MigratorConfig.new()
+			.driver("sqlite")
+			.url("file:x")
+			.dir("db/migrations")
+			.profile("prod")
+			.historyTable("MY_HISTORY")
+			.lockTable("MY_LOCK")
+			.lockTtlMillis(1000)).toSettings()
+		Assert.equals("sqlite", overridden.getDriver())
+		Assert.equals("file:x", overridden.getUrl())
+		Assert.equals("db/migrations", overridden.getDir())
+		Assert.equals("prod", overridden.getProfile())
+		Assert.equals("MY_HISTORY", overridden.getHistoryTable())
+		Assert.equals("MY_LOCK", overridden.getLockTable())
+		Assert.isTrue(overridden.getLockTtlMillis() == 1000)
+	}
+
+	@Test
+	pub void runWithAppliesPendingMigrations() {
+		var url = "file:facade-run?mode=memory&cache=shared"
+		var db, kerr = Connector.open(Datasource.new("sqlite", url), SqliteDialect.new())
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		var dir = Paths.join(this.root, "000_users")
+		Files.mkdir(dir)
+		Files.write(Paths.join(dir, "up.sql"), "CREATE TABLE users(id INTEGER PRIMARY KEY);")
+		Files.write(Paths.join(dir, "down.sql"), "DROP TABLE users;")
+
+		var result, err = Migrator.runWith(MigratorConfig.new()
+			.driver("sqlite").url(url).dir(this.root))
+		if (Exceptions.eval(err)) {
+			Assert.fail("runWith: ${err}")
+			db.close()
+			return
+		}
+		Assert.equals(1, Lists.length(result.getExecuted()))
+		Assert.equals("000_users", result.getExecuted()[0])
+
+		var row, qerr = db.queryOne(
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+			FacadeCountRow.class)
+		if (Exceptions.eval(qerr)) {
+			Assert.fail("verify: ${qerr}")
+			db.close()
+			return
+		}
+		Assert.isTrue(row.getN() == 1)
+		db.close()
+	}
+}

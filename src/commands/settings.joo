@@ -1,0 +1,21 @@
+package joolang.migrator.commands
+
+import joolang.migrator.engine.Defaults
+import joolang.migrator.engine.RunSettings
+
+/** Folds a command's flags over the package defaults into engine settings —
+ * the one place the CLI's flag-to-settings mapping lives, so every command
+ * resolves identically. An empty flag defers: driver/url to the props/env
+ * ladder, the rest to Defaults. */
+pub class CliSettings {
+
+	pub static RunSettings build(driver string, url string, dir string, profile string,
+			historyTable string, lockTable string, lockTtlSeconds long) {
+		return RunSettings.new(driver, url,
+			dir == "" ? Defaults.dir() : dir,
+			profile == "" ? Defaults.profile() : profile,
+			historyTable == "" ? Defaults.historyTable() : historyTable,
+			lockTable == "" ? Defaults.lockTable() : lockTable,
+			lockTtlSeconds <= 0 ? Defaults.lockTtlMillis() : lockTtlSeconds * 1000)
+	}
+}

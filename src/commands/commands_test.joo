@@ -1,0 +1,123 @@
+package joolang.migrator.commands
+
+import std.test.Test
+import std.test.Before
+import std.test.After
+import std.test.Assert
+import std.cli.Cli
+import std.io.Files
+import std.io.Paths
+import std.sql.Db
+import joolang.migrator.dialects.SqliteDialect
+import joolang.migrator.stores.Connector
+import joolang.migrator.stores.Datasource
+
+/** A COUNT(*) scan target for verification queries. */
+pub record CliCountRow {
+	intr n long: [getter]
+}
+
+// CLI contract, driven exactly like production: synthetic argv through the
+// same Cli.run dispatch main() uses — the full up/status/validate/down cycle,
+// the create scaffolder (sequential codes, name gate) and error exit codes.
+pub class CommandsTest {
+
+	intr root string
+
+	pub CommandsTest() {
+		this.root = ""
+	}
+
+	@Before
+	pub void createScratchRoot() {
+		var root, err = Files.mkdirTemp("", "joo-migrator-cli-*")
+		if (Exceptions.eval(err)) {
+			Assert.fail("mkdirTemp: ${err}")
+			return
+		}
+		this.root = root
+	}
+
+	@After
+	pub void removeScratchRoot() {
+		Files.remove(this.root)
+	}
+
+	@Test
+	pub void upStatusValidateDownCycle() {
+		var url = "file:cli-cycle?mode=memory&cache=shared"
+		var db, kerr = Connector.open(Datasource.new("sqlite", url), SqliteDialect.new())
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_users", "CREATE TABLE users(id INTEGER PRIMARY KEY);",
+			"DROP TABLE users;")
+
+		Assert.equals(0, CommandsTest.cli([]string{"up",
+			"--driver", "sqlite", "--url", url, "--dir", this.root}))
+		Assert.isTrue(CommandsTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'users'") == 1)
+
+		Assert.equals(0, CommandsTest.cli([]string{"status",
+			"--driver", "sqlite", "--url", url, "--dir", this.root}))
+		Assert.equals(0, CommandsTest.cli([]string{"validate",
+			"--driver", "sqlite", "--url", url, "--dir", this.root}))
+
+		Assert.equals(0, CommandsTest.cli([]string{"down", "--steps", "1",
+			"--driver", "sqlite", "--url", url, "--dir", this.root}))
+		Assert.isTrue(CommandsTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'users'") == 0)
+		db.close()
+	}
+
+	@Test
+	pub void createScaffoldsSequentialFolders() {
+		Assert.equals(0, CommandsTest.cli([]string{"create", "add_users", "--dir", this.root}))
+		var first = Paths.join(this.root, "000_add_users")
+		Assert.isTrue(Files.isDir(first))
+		Assert.isTrue(Files.exists(Paths.join(first, "up.sql")))
+		Assert.isTrue(Files.exists(Paths.join(first, "down.sql")))
+		Assert.isTrue(Files.exists(Paths.join(first, "migration.yml")))
+
+		Assert.equals(0, CommandsTest.cli([]string{"create", "add_orders", "--dir", this.root}))
+		Assert.isTrue(Files.isDir(Paths.join(this.root, "001_add_orders")))
+
+		// the scaffolded tree must be immediately scannable: metadata decodes
+		Assert.equals(1, CommandsTest.cli([]string{"create", "Bad Name!", "--dir", this.root}))
+	}
+
+	@Test
+	pub void failuresExitOne() {
+		Assert.equals(1, CommandsTest.cli([]string{"up",
+			"--driver", "no-such-db", "--url", "x", "--dir", this.root}))
+		Assert.equals(1, CommandsTest.cli([]string{"down",
+			"--driver", "sqlite", "--url", "file:cli-err?mode=memory&cache=shared",
+			"--dir", Paths.join(this.root, "missing")}))
+	}
+
+	// --- fixture helpers -----------------------------------------------------
+
+	// cli dispatches argv against the same command set main() wires.
+	intr static int cli(argv []string) {
+		return Cli.run(argv, UpCmd.class, DownCmd.class, StatusCmd.class,
+			ValidateCmd.class, CreateCmd.class)
+	}
+
+	intr void writeMigration(folder string, up string, down string) {
+		var dir = Paths.join(this.root, folder)
+		Files.mkdir(dir)
+		Files.write(Paths.join(dir, "up.sql"), up)
+		Files.write(Paths.join(dir, "down.sql"), down)
+	}
+
+	// count runs a COUNT(*) query, failing the test on error.
+	intr static long count(db Db, query string) {
+		var row, err = db.queryOne(query, CliCountRow.class)
+		if (Exceptions.eval(err)) {
+			Assert.fail("count query: ${err}")
+			return -1
+		}
+		return row.getN()
+	}
+}

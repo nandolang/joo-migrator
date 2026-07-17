@@ -1,0 +1,35 @@
+package joolang.migrator.engine
+
+import std.os.Env
+
+/** The package-wide defaults both entry modes share: the in-app facade
+ * (Migrator.run) and the standalone CLI build their RunSettings from the same
+ * values, so the two modes can never drift apart. */
+pub class Defaults {
+
+	/** Where migrations live, relative to the project root. */
+	pub static string dir() {
+		return "resources/migrations"
+	}
+
+	pub static string historyTable() {
+		return "JOO_MIGRATIONS_HISTORY"
+	}
+
+	pub static string lockTable() {
+		return "JOO_MIGRATIONS_LOCK"
+	}
+
+	/** How long a held lock stays valid: generous enough for slow data
+	 * migrations, short enough that a crashed holder frees itself within
+	 * fifteen minutes. */
+	pub static long lockTtlMillis() {
+		return 900000
+	}
+
+	/** The active profile — the same JOO_ENV the props ladder uses, so a
+	 * migration scoped to "dev" runs exactly when properties-dev.json applies. */
+	pub static string profile() {
+		return Env.getOr("JOO_ENV", "")
+	}
+}

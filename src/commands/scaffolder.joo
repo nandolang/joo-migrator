@@ -1,0 +1,73 @@
+package joolang.migrator.commands
+
+import std.io.Files
+import std.io.Paths
+import std.collections.Lists
+import joolang.migrator.discovery.Scanner
+
+/** Scaffolds the next migration folder: scans the tree (validating it on the
+ * way), takes the highest code plus one, and lays out `NNN_name/` with an
+ * up.sql, a down.sql and a migration.yml carrying decodable defaults. */
+pub class Scaffolder {
+
+	/** Creates the next migration folder under root.
+	 * @param root the migrations folder (created when missing)
+	 * @param name the migration name (snake_case)
+	 * @return the created folder path */
+	pub static (string, exception) create(root string, name string) {
+		var nerr = Scaffolder.checkName(name)
+		if (Exceptions.eval(nerr)) {
+			return "", nerr
+		}
+		var merr = Files.mkdir(root)
+		if (Exceptions.eval(merr)) {
+			return "", merr
+		}
+		var existing, serr = Scanner.scan(root)
+		if (Exceptions.eval(serr)) {
+			return "", serr
+		}
+		var next = 0
+		if (!Lists.isEmpty(existing)) {
+			next = existing[Lists.length(existing) - 1].getCode() + 1
+		}
+		var folder = "${next}".padStart(3, "0") + "_" + name
+		var dir = Paths.join(root, folder)
+		var derr = Files.mkdir(dir)
+		if (Exceptions.eval(derr)) {
+			return "", derr
+		}
+		var uerr = Files.write(Paths.join(dir, "up.sql"),
+			"-- ${folder}: forward migration\n")
+		if (Exceptions.eval(uerr)) {
+			return "", uerr
+		}
+		var werr = Files.write(Paths.join(dir, "down.sql"),
+			"-- ${folder}: revert of up.sql (leave empty only for a consciously irreversible change)\n")
+		if (Exceptions.eval(werr)) {
+			return "", werr
+		}
+		var yerr = Files.write(Paths.join(dir, "migration.yml"),
+			"description: \"\"\nprofiles: []\n")
+		if (Exceptions.eval(yerr)) {
+			return "", yerr
+		}
+		return dir, Exceptions.NULL
+	}
+
+	// checkName gates what lands in a folder name: snake_case keeps ids
+	// portable across filesystems and shells.
+	intr static exception checkName(name string) {
+		if (name == "") {
+			return Exceptions.new("the migration name is empty")
+		}
+		for (var c : name.runes()) {
+			var ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
+			if (!ok) {
+				return Exceptions.new(
+					"invalid migration name '${name}': use snake_case (a-z, 0-9, _)")
+			}
+		}
+		return Exceptions.NULL
+	}
+}

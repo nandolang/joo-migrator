@@ -1,0 +1,607 @@
+package joolang.migrator.engine
+
+import std.test.Test
+import std.test.Before
+import std.test.After
+import std.test.Assert
+import std.io.Files
+import std.io.Paths
+import std.collections.Lists
+import std.sql.Db
+import joolang.migrator.dialects.Dialect
+import joolang.migrator.dialects.SqliteDialect
+import joolang.migrator.discovery.Migration
+import joolang.migrator.discovery.MigrationMeta
+import joolang.migrator.stores.AppliedMigration
+import joolang.migrator.stores.Connector
+import joolang.migrator.stores.Datasource
+import joolang.migrator.stores.HistoryStore
+import joolang.migrator.stores.LockManager
+
+/** SQLite masquerading as a dialect without transactional DDL: routes the
+ * Executor onto the sequential + compensation strategy (the MySQL semantics)
+ * over the same in-memory database the transactional tests use. */
+pub class SequentialDialect impl: Dialect {
+
+	intr inner SqliteDialect
+
+	pub SequentialDialect() {
+		this.inner = SqliteDialect.new()
+	}
+
+	pub string name() {
+		return "sqlite-sequential"
+	}
+
+	pub boolean supportsTransactionalDdl() {
+		return false
+	}
+
+	pub string normalizeUrl(url string) {
+		return this.inner.normalizeUrl(url)
+	}
+
+	pub string createHistoryTable(table string) {
+		return this.inner.createHistoryTable(table)
+	}
+
+	pub string createLockTable(table string) {
+		return this.inner.createLockTable(table)
+	}
+
+	pub string insertHistory(table string) {
+		return this.inner.insertHistory(table)
+	}
+
+	pub string deleteHistory(table string) {
+		return this.inner.deleteHistory(table)
+	}
+
+	pub string selectApplied(table string) {
+		return this.inner.selectApplied(table)
+	}
+
+	pub string insertLock(table string) {
+		return this.inner.insertLock(table)
+	}
+
+	pub string selectLock(table string) {
+		return this.inner.selectLock(table)
+	}
+
+	pub string stealLock(table string) {
+		return this.inner.stealLock(table)
+	}
+
+	pub string releaseLock(table string) {
+		return this.inner.releaseLock(table)
+	}
+}
+
+/** A COUNT(*) scan target for verification queries. */
+pub record CountRow {
+	intr n long: [getter]
+}
+
+// Engine contract: pure planning rules (pending/profile/drift/down selection)
+// and the full Runner flows over in-memory SQLite — apply order, ledger
+// content, whole-batch rollback, reverts, lock release on failure and the
+// profile gate. Each integration test holds a "keeper" connection so the
+// shared-cache database outlives the Runner's own open/close cycle.
+pub class EngineTest {
+
+	intr root string
+
+	pub EngineTest() {
+		this.root = ""
+	}
+
+	@Before
+	pub void createScratchRoot() {
+		var root, err = Files.mkdirTemp("", "joo-migrator-engine-*")
+		if (Exceptions.eval(err)) {
+			Assert.fail("mkdirTemp: ${err}")
+			return
+		}
+		this.root = root
+	}
+
+	@After
+	pub void removeScratchRoot() {
+		Files.remove(this.root)
+	}
+
+	// --- pure planner rules --------------------------------------------------
+
+	@Test
+	pub void planUpFiltersAppliedAndProfile() {
+		var discovered = []Migration{
+			EngineTest.mig(0, "000_init", "aaa", []string{}),
+			EngineTest.mig(1, "001_seed", "bbb", []string{"dev"}),
+			EngineTest.mig(2, "002_next", "ccc", []string{})}
+		var applied = []AppliedMigration{AppliedMigration.new(0, "000_init", "aaa")}
+
+		var plan, err = Planner.up(discovered, applied, "prod")
+		if (Exceptions.eval(err)) {
+			Assert.fail("plan: ${err}")
+			return
+		}
+		// 000 already applied, 001 is dev-only: prod pends 002 alone
+		Assert.equals(1, Lists.length(plan.getSteps()))
+		Assert.equals("002_next", plan.getSteps()[0].getId())
+
+		var devPlan, derr = Planner.up(discovered, applied, "dev")
+		if (Exceptions.eval(derr)) {
+			Assert.fail("dev plan: ${derr}")
+			return
+		}
+		// dev fills the profile gap below an unapplied later code, in order
+		Assert.equals(2, Lists.length(devPlan.getSteps()))
+		Assert.equals("001_seed", devPlan.getSteps()[0].getId())
+		Assert.equals("002_next", devPlan.getSteps()[1].getId())
+	}
+
+	@Test
+	pub void planUpRejectsChecksumDrift() {
+		var discovered = []Migration{EngineTest.mig(0, "000_init", "CHANGED", []string{})}
+		var applied = []AppliedMigration{AppliedMigration.new(0, "000_init", "aaa")}
+		var _, err = Planner.up(discovered, applied, "")
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "checksum drift")
+	}
+
+	@Test
+	pub void planDownSelectsStepsAndTarget() {
+		var discovered = []Migration{
+			EngineTest.mig(0, "000_init", "aaa", []string{}),
+			EngineTest.mig(1, "001_users", "bbb", []string{}),
+			EngineTest.mig(2, "002_orders", "ccc", []string{})}
+		var applied = []AppliedMigration{
+			AppliedMigration.new(0, "000_init", "aaa"),
+			AppliedMigration.new(1, "001_users", "bbb"),
+			AppliedMigration.new(2, "002_orders", "ccc")}
+
+		var byStep, serr = Planner.down(discovered, applied, 1, -1, "")
+		if (Exceptions.eval(serr)) {
+			Assert.fail("steps: ${serr}")
+			return
+		}
+		Assert.equals(1, Lists.length(byStep.getSteps()))
+		Assert.equals("002_orders", byStep.getSteps()[0].getId())
+
+		var byTarget, terr = Planner.down(discovered, applied, 0, 0, "")
+		if (Exceptions.eval(terr)) {
+			Assert.fail("target: ${terr}")
+			return
+		}
+		// down --to 0: everything above code 0, newest first
+		Assert.equals(2, Lists.length(byTarget.getSteps()))
+		Assert.equals("002_orders", byTarget.getSteps()[0].getId())
+		Assert.equals("001_users", byTarget.getSteps()[1].getId())
+
+		var _, berr = Planner.down(discovered, applied, 0, -1, "")
+		Assert.isTrue(Exceptions.eval(berr))
+		Assert.contains("${berr}", "--steps above zero or a --to target")
+	}
+
+	@Test
+	pub void planDownRefusesMissingFolderAndEmptyDown() {
+		var applied = []AppliedMigration{AppliedMigration.new(0, "000_gone", "aaa")}
+		var _, merr = Planner.down([]Migration{}, applied, 1, -1, "")
+		Assert.isTrue(Exceptions.eval(merr))
+		Assert.contains("${merr}", "gone from disk")
+
+		var irreversible = Migration.new(0, "000_oneway", "", "DROP TABLE legacy;", "",
+			"aaa", MigrationMeta.new("", []string{}))
+		var applied2 = []AppliedMigration{AppliedMigration.new(0, "000_oneway", "aaa")}
+		var _, eerr = Planner.down([]Migration{irreversible}, applied2, 1, -1, "")
+		Assert.isTrue(Exceptions.eval(eerr))
+		Assert.contains("${eerr}", "down.sql is empty")
+	}
+
+	@Test
+	pub void statusReportsEveryState() {
+		var discovered = []Migration{
+			EngineTest.mig(0, "000_init", "aaa", []string{}),
+			EngineTest.mig(1, "001_seed", "bbb", []string{"dev"}),
+			EngineTest.mig(2, "002_next", "DRIFTED", []string{})}
+		var applied = []AppliedMigration{
+			AppliedMigration.new(0, "000_init", "aaa"),
+			AppliedMigration.new(2, "002_next", "ccc"),
+			AppliedMigration.new(7, "007_gone", "ddd")}
+
+		var entries = Planner.status(discovered, applied, "prod")
+		Assert.equals(4, Lists.length(entries))
+		Assert.equals("applied", entries[0].getState())
+		Assert.equals("skipped (profile)", entries[1].getState())
+		Assert.equals("drifted (up.sql changed after apply)", entries[2].getState())
+		Assert.equals("missing (applied but not on disk)", entries[3].getState())
+		Assert.equals(7, entries[3].getCode())
+	}
+
+	// --- runner flows over SQLite --------------------------------------------
+
+	@Test
+	pub void upAppliesInOrderRecordsLedgerAndIsIdempotent() {
+		var db, kerr = EngineTest.keeper("eng-apply")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("001_users", "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);",
+			"DROP TABLE users;")
+		this.writeMigration("000_init", "CREATE TABLE app_meta(k TEXT);", "DROP TABLE app_meta;")
+		this.writeMigration("002_seed", "INSERT INTO users(name) VALUES ('ana');",
+			"DELETE FROM users;")
+
+		var result, err = Runner.up(this.settings("eng-apply", ""))
+		if (Exceptions.eval(err)) {
+			Assert.fail("up: ${err}")
+			db.close()
+			return
+		}
+		Assert.equals(3, Lists.length(result.getExecuted()))
+		Assert.equals("000_init", result.getExecuted()[0])
+		Assert.equals("001_users", result.getExecuted()[1])
+		Assert.equals("002_seed", result.getExecuted()[2])
+		Assert.isTrue(EngineTest.count(db, "SELECT COUNT(*) AS n FROM users") == 1)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 3)
+
+		// a second run finds nothing pending — and touches nothing
+		var again, aerr = Runner.up(this.settings("eng-apply", ""))
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("rerun: ${aerr}")
+			db.close()
+			return
+		}
+		Assert.isTrue(Lists.isEmpty(again.getExecuted()))
+		Assert.isTrue(EngineTest.count(db, "SELECT COUNT(*) AS n FROM users") == 1)
+		db.close()
+	}
+
+	@Test
+	pub void upRollsBackTheWholeBatchOnFailure() {
+		var db, kerr = EngineTest.keeper("eng-rollback")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_users", "CREATE TABLE users(id INTEGER PRIMARY KEY);",
+			"DROP TABLE users;")
+		this.writeMigration("001_broken", "CREATE TABLE oops(BROKEN SYNTAX;", "SELECT 1;")
+
+		var _, err = Runner.up(this.settings("eng-rollback", ""))
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "001_broken")
+		// SQLite DDL is transactional: migration 000 must have vanished with
+		// the batch, ledger included
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'users'") == 0)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 0)
+		db.close()
+	}
+
+	@Test
+	pub void downRevertsAndCleansTheLedger() {
+		var db, kerr = EngineTest.keeper("eng-down")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_users", "CREATE TABLE users(id INTEGER PRIMARY KEY);",
+			"DROP TABLE users;")
+		this.writeMigration("001_orders", "CREATE TABLE orders(id INTEGER PRIMARY KEY);",
+			"DROP TABLE orders;")
+		var _, uerr = Runner.up(this.settings("eng-down", ""))
+		if (Exceptions.eval(uerr)) {
+			Assert.fail("up: ${uerr}")
+			db.close()
+			return
+		}
+
+		var result, derr = Runner.down(this.settings("eng-down", ""), 1, -1)
+		if (Exceptions.eval(derr)) {
+			Assert.fail("down: ${derr}")
+			db.close()
+			return
+		}
+		Assert.equals(1, Lists.length(result.getExecuted()))
+		Assert.equals("001_orders", result.getExecuted()[0])
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'orders'") == 0)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'users'") == 1)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 1)
+		db.close()
+	}
+
+	@Test
+	pub void failedRunStillReleasesTheLock() {
+		var db, kerr = EngineTest.keeper("eng-lock")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_broken", "TOTALLY NOT SQL;", "SELECT 1;")
+		var _, err = Runner.up(this.settings("eng-lock", ""))
+		Assert.isTrue(Exceptions.eval(err))
+
+		// the lock row must be gone: a fresh acquire succeeds immediately
+		var owner, aerr = LockManager.acquire(db, SqliteDialect.new(), "JOO_MIGRATIONS_LOCK", 60000)
+		if (Exceptions.eval(aerr)) {
+			Assert.fail("lock was not released: ${aerr}")
+			db.close()
+			return
+		}
+		Assert.isTrue(owner.length() > 0)
+		db.close()
+	}
+
+	@Test
+	pub void profileGateSkipsThenFillsTheGap() {
+		var db, kerr = EngineTest.keeper("eng-profile")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_schema", "CREATE TABLE t(id INTEGER PRIMARY KEY);", "DROP TABLE t;")
+		this.writeMetaMigration("001_devseed", "INSERT INTO t(id) VALUES (7);",
+			"DELETE FROM t WHERE id = 7;", "profiles: [dev]\n")
+		this.writeMigration("002_index", "CREATE INDEX t_id ON t(id);", "DROP INDEX t_id;")
+
+		var prod, perr = Runner.up(this.settings("eng-profile", "prod"))
+		if (Exceptions.eval(perr)) {
+			Assert.fail("prod up: ${perr}")
+			db.close()
+			return
+		}
+		Assert.equals(2, Lists.length(prod.getExecuted()))
+		Assert.isTrue(EngineTest.count(db, "SELECT COUNT(*) AS n FROM t") == 0)
+
+		// the dev run fills the profile gap below the already-applied 002
+		var dev, verr = Runner.up(this.settings("eng-profile", "dev"))
+		if (Exceptions.eval(verr)) {
+			Assert.fail("dev up: ${verr}")
+			db.close()
+			return
+		}
+		Assert.equals(1, Lists.length(dev.getExecuted()))
+		Assert.equals("001_devseed", dev.getExecuted()[0])
+		Assert.isTrue(EngineTest.count(db, "SELECT COUNT(*) AS n FROM t") == 1)
+		db.close()
+	}
+
+	@Test
+	pub void statusAndValidateFollowTheLedger() {
+		var db, kerr = EngineTest.keeper("eng-status")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		this.writeMigration("000_users", "CREATE TABLE users(id INTEGER PRIMARY KEY);",
+			"DROP TABLE users;")
+		var _, uerr = Runner.up(this.settings("eng-status", ""))
+		if (Exceptions.eval(uerr)) {
+			Assert.fail("up: ${uerr}")
+			db.close()
+			return
+		}
+		this.writeMigration("001_orders", "CREATE TABLE orders(id INTEGER PRIMARY KEY);",
+			"DROP TABLE orders;")
+
+		var entries, serr = Runner.status(this.settings("eng-status", ""))
+		if (Exceptions.eval(serr)) {
+			Assert.fail("status: ${serr}")
+			db.close()
+			return
+		}
+		Assert.equals(2, Lists.length(entries))
+		Assert.equals("applied", entries[0].getState())
+		Assert.equals("pending", entries[1].getState())
+
+		var verr = Runner.validate(this.settings("eng-status", ""))
+		Assert.isFalse(Exceptions.eval(verr))
+
+		// editing the applied migration is the drift validate must reject
+		Files.write(Paths.join(Paths.join(this.root, "000_users"), "up.sql"),
+			"CREATE TABLE users(id INTEGER PRIMARY KEY, sneaky TEXT);")
+		var derr = Runner.validate(this.settings("eng-status", ""))
+		Assert.isTrue(Exceptions.eval(derr))
+		Assert.contains("${derr}", "checksum drift")
+		db.close()
+	}
+
+	// --- the sequential (MySQL-semantics) strategy over SQLite ---------------
+
+	@Test
+	pub void sequentialUpAppliesAndRecords() {
+		var db, kerr = EngineTest.keeper("eng-sequp")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		var dialect = SequentialDialect.new()
+		HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		var plan = Plan.new([]Migration{
+			EngineTest.realMig(0, "000_t", "CREATE TABLE t(id INTEGER PRIMARY KEY);", "DROP TABLE t;"),
+			EngineTest.realMig(1, "001_seed", "INSERT INTO t(id) VALUES (1);", "DELETE FROM t;")}, "dev")
+
+		var result, err = Executor.up(db, dialect, "JOO_MIGRATIONS_HISTORY", plan)
+		if (Exceptions.eval(err)) {
+			Assert.fail("sequential up: ${err}")
+			db.close()
+			return
+		}
+		Assert.equals(2, Lists.length(result.getExecuted()))
+		Assert.isTrue(EngineTest.count(db, "SELECT COUNT(*) AS n FROM t") == 1)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 2)
+		db.close()
+	}
+
+	@Test
+	pub void sequentialFailureCompensatesTheBatchInReverse() {
+		var db, kerr = EngineTest.keeper("eng-seqcomp")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		var dialect = SequentialDialect.new()
+		HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		var plan = Plan.new([]Migration{
+			EngineTest.realMig(0, "000_table", "CREATE TABLE t(id INTEGER PRIMARY KEY);", "DROP TABLE t;"),
+			EngineTest.realMig(1, "001_index", "CREATE INDEX t_idx ON t(id);", "DROP INDEX t_idx;"),
+			EngineTest.realMig(2, "002_broken", "TOTALLY NOT SQL;", "SELECT 1;")}, "dev")
+
+		var _, err = Executor.up(db, dialect, "JOO_MIGRATIONS_HISTORY", plan)
+		Assert.isTrue(Exceptions.eval(err))
+		Assert.contains("${err}", "migration '002_broken' failed")
+		Assert.contains("${err}", "compensated with down.sql (best effort)")
+		// reverse-order proof: DROP INDEX must run BEFORE DROP TABLE (the table
+		// drop takes the index with it) — a wrong order would fail the index
+		// revert and surface as a "compensating ... failed" line
+		Assert.isFalse("${err}".contains("compensating"))
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 't'") == 0)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 0)
+		db.close()
+	}
+
+	@Test
+	pub void sequentialCompensationSkipsEmptyDownAndKeepsFailedReverts() {
+		var db, kerr = EngineTest.keeper("eng-seqkeep")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		var dialect = SequentialDialect.new()
+		HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		var plan = Plan.new([]Migration{
+			EngineTest.realMig(0, "000_oneway", "CREATE TABLE a(x INT);", ""),
+			EngineTest.realMig(1, "001_bad", "CREATE TABLE b(x INT);", "DROP TABLE nonexistent_zzz;"),
+			EngineTest.realMig(2, "002_broken", "TOTALLY NOT SQL;", "SELECT 1;")}, "dev")
+
+		var _, err = Executor.up(db, dialect, "JOO_MIGRATIONS_HISTORY", plan)
+		Assert.isTrue(Exceptions.eval(err))
+		// an empty down.sql is skipped, a failing revert keeps its ledger row:
+		// both stay applied and both are loudly reported
+		Assert.contains("${err}", "compensation skipped '000_oneway'")
+		Assert.contains("${err}", "compensating '001_bad' failed")
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 2)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'a'") == 1)
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'b'") == 1)
+		db.close()
+	}
+
+	@Test
+	pub void sequentialDownRevertsAndStopsOnFailure() {
+		var db, kerr = EngineTest.keeper("eng-seqdown")
+		if (Exceptions.eval(kerr)) {
+			Assert.fail("keeper: ${kerr}")
+			return
+		}
+		var dialect = SequentialDialect.new()
+		HistoryStore.ensure(db, dialect, "JOO_MIGRATIONS_HISTORY")
+		var t1 = EngineTest.realMig(0, "000_t1", "CREATE TABLE t1(x INT);", "DROP TABLE t1;")
+		var t2 = EngineTest.realMig(1, "001_t2", "CREATE TABLE t2(x INT);", "DROP TABLE t2;")
+		var _, uerr = Executor.up(db, dialect, "JOO_MIGRATIONS_HISTORY",
+			Plan.new([]Migration{t1, t2}, "dev"))
+		if (Exceptions.eval(uerr)) {
+			Assert.fail("seed up: ${uerr}")
+			db.close()
+			return
+		}
+
+		var result, derr = Executor.down(db, dialect, "JOO_MIGRATIONS_HISTORY",
+			Plan.new([]Migration{t2, t1}, "dev"))
+		if (Exceptions.eval(derr)) {
+			Assert.fail("sequential down: ${derr}")
+			db.close()
+			return
+		}
+		Assert.equals(2, Lists.length(result.getExecuted()))
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 0)
+
+		// a failing revert stops the run and reports how far it got
+		var _, uerr2 = Executor.up(db, dialect, "JOO_MIGRATIONS_HISTORY",
+			Plan.new([]Migration{t1, t2}, "dev"))
+		if (Exceptions.eval(uerr2)) {
+			Assert.fail("re-up: ${uerr2}")
+			db.close()
+			return
+		}
+		var broken = EngineTest.realMig(1, "001_t2", "CREATE TABLE t2(x INT);", "TOTALLY NOT SQL;")
+		var _, ferr = Executor.down(db, dialect, "JOO_MIGRATIONS_HISTORY",
+			Plan.new([]Migration{broken, t1}, "dev"))
+		Assert.isTrue(Exceptions.eval(ferr))
+		Assert.contains("${ferr}", "reverting '001_t2' failed after 0 successful")
+		Assert.isTrue(EngineTest.count(db,
+			"SELECT COUNT(*) AS n FROM JOO_MIGRATIONS_HISTORY") == 2)
+		db.close()
+	}
+
+	// --- fixture helpers -----------------------------------------------------
+
+	// realMig builds a Migration with real scripts for direct Executor runs
+	// (which trust Planner-validated plans, so the checksum is a dummy).
+	intr static Migration realMig(code int, id string, up string, down string) {
+		return Migration.new(code, id, "", up, down, "sum-${code}",
+			MigrationMeta.new("", []string{}))
+	}
+
+	// mig builds an in-memory Migration for the pure planner tests (scripts are
+	// non-empty so down planning accepts them).
+	intr static Migration mig(code int, id string, checksum string, profiles []string) {
+		return Migration.new(code, id, "", "up-sql", "down-sql", checksum,
+			MigrationMeta.new("", profiles))
+	}
+
+	// writeMigration lays out one metadata-less migration folder under root.
+	intr void writeMigration(folder string, up string, down string) {
+		var dir = Paths.join(this.root, folder)
+		Files.mkdir(dir)
+		Files.write(Paths.join(dir, "up.sql"), up)
+		Files.write(Paths.join(dir, "down.sql"), down)
+	}
+
+	// writeMetaMigration also writes a migration.yml.
+	intr void writeMetaMigration(folder string, up string, down string, yml string) {
+		this.writeMigration(folder, up, down)
+		Files.write(Paths.join(Paths.join(this.root, folder), "migration.yml"), yml)
+	}
+
+	// settings points a run at this test's migrations root and shared-cache
+	// database.
+	intr RunSettings settings(dbName string, profile string) {
+		return RunSettings.new("sqlite", EngineTest.url(dbName), this.root, profile,
+			"JOO_MIGRATIONS_HISTORY", "JOO_MIGRATIONS_LOCK", 60000)
+	}
+
+	// keeper holds a connection to the named shared-cache database so it
+	// outlives the Runner's own open/close cycle.
+	intr static (Db, exception) keeper(dbName string) {
+		return Connector.open(Datasource.new("sqlite", EngineTest.url(dbName)), SqliteDialect.new())
+	}
+
+	intr static string url(dbName string) {
+		return "file:${dbName}?mode=memory&cache=shared"
+	}
+
+	// count runs a COUNT(*) query, failing the test on error.
+	intr static long count(db Db, query string) {
+		var row, err = db.queryOne(query, CountRow.class)
+		if (Exceptions.eval(err)) {
+			Assert.fail("count query: ${err}")
+			return -1
+		}
+		return row.getN()
+	}
+}

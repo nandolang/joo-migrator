@@ -1,0 +1,17 @@
+{
+	"#project": "joo-migrator example — an application consuming the migrator in automatic mode",
+	"#proj.id": "joolang.migrator.example",
+	"#deps-note": "the joo dep below assumes the published module path; until the package is published to a git remote, build this example against the repository root directly",
+	"main": "src/main.joo",
+	"deps": {
+		"joo": {
+			"github.com/joolang/joo-migrator": "v0.1.0"
+		},
+		"go": {
+			"modernc.org/sqlite": "v1.53.0"
+		}
+	},
+	"goDeps": [
+		"modernc.org/sqlite"
+	]
+}

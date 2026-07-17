@@ -1,0 +1,6 @@
+{
+	"db": {
+		"driver": "sqlite",
+		"url": "file:example.db"
+	}
+}

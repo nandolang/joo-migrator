@@ -1,0 +1,28 @@
+package joolang.migrator.engine
+
+import joolang.migrator.discovery.Migration
+
+/** An ordered execution plan, already filtered and validated by the Planner:
+ * up plans carry pending migrations in ascending code order, down plans carry
+ * the migrations to revert in descending code order. */
+pub record Plan {
+	/** The migrations to execute, in execution order. */
+	intr steps []Migration: [getter]
+	/** The active profile the plan was computed for. */
+	intr profile string: [getter]
+}
+
+/** The outcome of an executed plan. */
+pub record RunResult {
+	/** Ids of the migrations that were executed, in execution order. */
+	intr executed []string: [getter]
+}
+
+/** One line of the `status` report, ordered by code. */
+pub record StatusEntry {
+	intr code int: [getter]
+	intr id string: [getter]
+	/** "applied" | "pending" | "skipped (profile)" | "missing (applied but not on disk)". */
+	intr state string: [getter]
+	intr description string: [getter]
+}

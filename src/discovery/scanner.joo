@@ -98,9 +98,7 @@ pub class Scanner {
 	}
 
 	// loadMeta normalizes the folder's metadata to JSON and decodes it typed;
-	// no metadata file means defaults (runs under every profile). (The local is
-	// named `text`, not `json`: a joo local named like a generated runtime import
-	// alias shadows it in the emitted Go — the known codegen-hygiene footgun.)
+	// no metadata file means defaults (runs under every profile).
 	intr static (MigrationMeta, exception) loadMeta(entry string, dir string) {
 		var text, merr = MetaFile.readAsJson(dir)
 		if (Exceptions.eval(merr)) {

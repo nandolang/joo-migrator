@@ -38,42 +38,42 @@ pub class MetaFileTest {
 	pub void yamlConvertsToJson() {
 		Files.write(Paths.join(this.dir, "migration.yml"),
 			"description: init database\nprofiles:\n  - dev\n  - prod\n")
-		var json, err = MetaFile.readAsJson(this.dir)
+		var text, err = MetaFile.readAsJson(this.dir)
 		if (Exceptions.eval(err)) {
 			Assert.fail("readAsJson: ${err}")
 			return
 		}
-		Assert.contains(json, "\"description\":\"init database\"")
-		Assert.contains(json, "\"profiles\":[\"dev\",\"prod\"]")
+		Assert.contains(text, "\"description\":\"init database\"")
+		Assert.contains(text, "\"profiles\":[\"dev\",\"prod\"]")
 	}
 
 	@Test
 	pub void yamlLongExtensionIsRecognized() {
 		Files.write(Paths.join(this.dir, "migration.yaml"), "description: long ext\n")
-		var json, err = MetaFile.readAsJson(this.dir)
+		var text, err = MetaFile.readAsJson(this.dir)
 		if (Exceptions.eval(err)) {
 			Assert.fail("readAsJson: ${err}")
 			return
 		}
-		Assert.contains(json, "\"description\":\"long ext\"")
+		Assert.contains(text, "\"description\":\"long ext\"")
 	}
 
 	@Test
 	pub void jsonPassesThroughUntouched() {
 		Files.write(Paths.join(this.dir, "migration.json"), "{\"profiles\":[\"prod\"]}")
-		var json, err = MetaFile.readAsJson(this.dir)
+		var text, err = MetaFile.readAsJson(this.dir)
 		if (Exceptions.eval(err)) {
 			Assert.fail("readAsJson: ${err}")
 			return
 		}
-		Assert.equals("{\"profiles\":[\"prod\"]}", json)
+		Assert.equals("{\"profiles\":[\"prod\"]}", text)
 	}
 
 	@Test
 	pub void missingMetadataIsEmptyNotAnError() {
-		var json, err = MetaFile.readAsJson(this.dir)
+		var text, err = MetaFile.readAsJson(this.dir)
 		Assert.isFalse(Exceptions.eval(err))
-		Assert.equals("", json)
+		Assert.equals("", text)
 	}
 
 	@Test
